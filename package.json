@@ -1,0 +1,42 @@
+{
+  "name": "pi-v4-anchor",
+  "version": "0.2.0",
+  "description": "A reversible DeepSeek V4 Pro trajectory anchor for Pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "deepseek",
+    "trajectory-anchor"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:live": "node --experimental-strip-types scripts/live-smoke.ts --run-paid",
+    "test:live:tool": "node --experimental-strip-types scripts/live-smoke.ts --run-paid --tool"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^24.0.0",
+    "typebox": "1.3.7",
+    "typescript": "~5.9.3"
+  }
+}

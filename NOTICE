@@ -1,0 +1,21 @@
+pi-v4-anchor adapts the Minimal-anchored bootstrap concept and selected prompt/tool
+text from pi-deepseek-anchor:
+
+  https://github.com/kxh4892636/pi-deepseek-anchor
+  reviewed revision d369f966c63098202a49207fdc06cc575de47490
+
+pi-deepseek-anchor is a Pi port of dsh-anchored-standard:
+
+  https://github.com/xiaobright/dsh-anchored-standard
+
+That project adapts the DeepSeek Harness Standard agent preset:
+
+  https://github.com/deepseek-ai/deepseek-harness
+  revision 47f943859bef60e4160492346772ded9b24f765a
+
+This implementation was independently reworked around Pi 0.84.2 public extension APIs,
+OpenAI Responses payloads, reversible runtime state, and native Windows/MSYS paths.
+
+DeepSeek, DeepSeek Harness, Pi, and the referenced project names belong to their
+respective owners. This community project is not affiliated with or endorsed by them.
+The full MIT permission notice is in LICENSE.

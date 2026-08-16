@@ -1,0 +1,21 @@
+node_modules/
+.pi/
+coverage/
+*.tsbuildinfo
+*.tgz
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Local credentials and provider configuration
+.env
+.env.*
+!.env.example
+.npmrc
+auth.json
+models.json
+*.pem
+*.key
+*.p12
+*.pfx
