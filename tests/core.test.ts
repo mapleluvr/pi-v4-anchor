@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as core from "../src/core.ts";
 import {
   MINIMAL_PERSONA,
   captureContinuationSystemPrompt,
@@ -223,6 +224,98 @@ test("captures another extension's system block on either side of the anchor", (
   }, base, "openai-completions"), `${base}${magicBlock}`);
 });
 
+test("captures every system and developer block before persistent replacement", () => {
+  const baseline = "BASE PI SYSTEM";
+  const cases = [
+    {
+      api: "openai-responses" as const,
+      payload: {
+        input: [
+          { role: "system", content: MINIMAL_PERSONA },
+          { role: "developer", content: "MAGIC CONTEXT" },
+          { role: "developer", content: [{ type: "input_text", text: "PROJECT RULES" }] },
+          { role: "user", content: "Continue" },
+        ],
+      },
+      items: (rewritten: any) => rewritten.input,
+    },
+    {
+      api: "openai-completions" as const,
+      payload: {
+        messages: [
+          { role: "system", content: MINIMAL_PERSONA },
+          { role: "developer", content: "MAGIC CONTEXT" },
+          { role: "developer", content: "PROJECT RULES" },
+          { role: "user", content: "Continue" },
+        ],
+      },
+      items: (rewritten: any) => rewritten.messages,
+    },
+    {
+      api: "anthropic-messages" as const,
+      payload: {
+        system: [
+          { type: "text", text: MINIMAL_PERSONA },
+          { type: "text", text: "MAGIC CONTEXT" },
+          { type: "text", text: "PROJECT RULES" },
+        ],
+        messages: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+      },
+      items: (rewritten: any) => rewritten.messages,
+    },
+  ];
+
+  for (const { api, payload, items } of cases) {
+    const context = captureContinuationSystemPrompt(payload, baseline, api);
+    assert.match(context, /MAGIC CONTEXT/);
+    assert.match(context, /PROJECT RULES/);
+    const rewritten = core.rewritePersistentPayload(payload, { api, context });
+    const wireItems = items(rewritten);
+    const contextItem = wireItems.find((item: unknown) => JSON.stringify(item).includes("MAGIC CONTEXT"));
+    assert.ok(contextItem, "persistent wire payload must include the aggregated context");
+    assert.match(JSON.stringify(contextItem), /MAGIC CONTEXT/);
+    assert.match(JSON.stringify(contextItem), /PROJECT RULES/);
+  }
+});
+
+test("does not duplicate a repeated post-Minimal context suffix", () => {
+  const baseline = "BASE PI SYSTEM";
+  const cases = [
+    {
+      api: "openai-responses" as const,
+      payload: {
+        input: [
+          { role: "system", content: `${MINIMAL_PERSONA}\n\nMAGIC CONTEXT` },
+          { role: "user", content: "Continue" },
+        ],
+      },
+    },
+    {
+      api: "openai-completions" as const,
+      payload: {
+        messages: [
+          { role: "system", content: `${MINIMAL_PERSONA}\n\nMAGIC CONTEXT` },
+          { role: "user", content: "Continue" },
+        ],
+      },
+    },
+    {
+      api: "anthropic-messages" as const,
+      payload: {
+        system: [{ type: "text", text: `${MINIMAL_PERSONA}\n\nMAGIC CONTEXT` }],
+        messages: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+      },
+    },
+  ];
+
+  for (const { api, payload } of cases) {
+    const first = captureContinuationSystemPrompt(payload, baseline, api);
+    const repeated = captureContinuationSystemPrompt(payload, first, api);
+    assert.equal(first, `${baseline}\n\nMAGIC CONTEXT`);
+    assert.equal(repeated, first);
+  }
+});
+
 test("restores Chat Completions and Anthropic system prompts without changing messages", () => {
 
   const chat = restoreSystemPrompt({
@@ -353,4 +446,59 @@ test("reads the latest anchor state from branch order and falls back to off", ()
     enabled: false,
     phase: "off",
   });
+});
+
+test("rewrites persistent payloads for every supported API without filtering normal tools", () => {
+  type PersistentRewrite = (payload: unknown, options: {
+    api: "openai-responses" | "openai-completions" | "anthropic-messages";
+    context: string;
+  }) => any;
+  const rewrite = (core as unknown as { rewritePersistentPayload?: PersistentRewrite }).rewritePersistentPayload;
+  assert.equal(typeof rewrite, "function");
+  if (!rewrite) return;
+
+  const context = "FULL PI SYSTEM\n\n<session-history>Magic Context</session-history>";
+  const responsePayload = {
+    instructions: "FULL PI SYSTEM",
+    previous_response_id: "response_123",
+    input: [
+      { role: "system", content: "FULL PI SYSTEM" },
+      { role: "developer", content: "LATE EXTENSION" },
+      { role: "user", content: "Continue" },
+    ],
+    tools: [{ type: "function", name: "ctx_search", parameters: {} }],
+  };
+  const responses = rewrite(responsePayload, { api: "openai-responses", context });
+  assert.deepEqual(responses.input[0], { role: "system", content: MINIMAL_PERSONA });
+  assert.match(JSON.stringify(responses.input[1]), /Magic Context/);
+  assert.deepEqual(responses.input.at(-1), { role: "user", content: "Continue" });
+  assert.equal(responses.instructions, MINIMAL_PERSONA);
+  assert.equal(responses.previous_response_id, "response_123");
+  assert.deepEqual(responses.tools, responsePayload.tools);
+  assert.equal(JSON.stringify(responsePayload).includes(MINIMAL_PERSONA), false);
+
+  const chatPayload = {
+    messages: [
+      { role: "system", content: "FULL PI SYSTEM" },
+      { role: "developer", content: "LATE EXTENSION" },
+      { role: "user", content: "Continue" },
+    ],
+    tools: [{ type: "function", function: { name: "ctx_search", parameters: {} } }],
+  };
+  const chat = rewrite(chatPayload, { api: "openai-completions", context });
+  assert.deepEqual(chat.messages[0], { role: "system", content: MINIMAL_PERSONA });
+  assert.match(JSON.stringify(chat.messages[1]), /Magic Context/);
+  assert.deepEqual(chat.messages.at(-1), { role: "user", content: "Continue" });
+  assert.deepEqual(chat.tools, chatPayload.tools);
+
+  const messagesPayload = {
+    system: [{ type: "text", text: "FULL PI SYSTEM" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+    tools: [{ name: "ctx_search", input_schema: {} }],
+  };
+  const messages = rewrite(messagesPayload, { api: "anthropic-messages", context });
+  assert.deepEqual(messages.system, [{ type: "text", text: MINIMAL_PERSONA }]);
+  assert.match(JSON.stringify(messages.messages[0]), /Magic Context/);
+  assert.deepEqual(messages.messages.at(-1), messagesPayload.messages[0]);
+  assert.deepEqual(messages.tools, messagesPayload.tools);
 });

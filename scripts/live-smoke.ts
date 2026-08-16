@@ -21,12 +21,15 @@ const toolMode = process.argv.includes("--tool");
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const sourceAgentDir = getAgentDir();
 const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-v4-anchor-live-"));
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = tempAgentDir;
 const tempProjectDir = await mkdtemp(join(tmpdir(), "pi-v4-anchor-live-project-"));
 let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 
 type CapturedPayload = {
   api: string;
   roles: unknown[];
+  userTexts: string[];
   systemText: string;
   toolNames: unknown[];
   maxOutputTokens: unknown;
@@ -50,7 +53,7 @@ function textOf(content: unknown): string {
     .filter((part): part is { type: string; text: string } => (
       typeof part === "object"
       && part !== null
-      && (part as { type?: unknown }).type === "text"
+      && (((part as { type?: unknown }).type === "text") || ((part as { type?: unknown }).type === "input_text"))
       && typeof (part as { text?: unknown }).text === "string"
     ))
     .map((part) => part.text)
@@ -82,6 +85,18 @@ function payloadRoles(payload: Record<string, unknown>): unknown[] {
   return Array.isArray(messages)
     ? messages.map((item) => typeof item === "object" && item !== null ? (item as { role?: unknown }).role : undefined)
     : [];
+}
+
+function payloadUserTexts(payload: Record<string, unknown>): string[] {
+  const messages = Array.isArray(payload.input) ? payload.input : payload.messages;
+  if (!Array.isArray(messages)) return [];
+  return messages.flatMap((item) => (
+    typeof item === "object"
+    && item !== null
+    && (item as { role?: unknown }).role === "user"
+      ? [textOf((item as { content?: unknown }).content)]
+      : []
+  ));
 }
 
 function maxOutputTokens(payload: Record<string, unknown>): unknown {
@@ -154,6 +169,7 @@ try {
           captured.push({
             api: model.api,
             roles: payloadRoles(payload),
+            userTexts: payloadUserTexts(payload),
             systemText: payloadSystemText(payload),
             toolNames: tools.map(toolName),
             maxOutputTokens: maxOutputTokens(payload),
@@ -204,8 +220,14 @@ try {
 
   if (toolMode) {
     assert.ok(captured[1], "the model did not make a tool call and continuation request");
-    assert.match(captured[1].systemText, /^BASE LIVE SMOKE SYSTEM PROMPT\nCurrent working directory: /);
-    assert.notEqual(captured[1].systemText, MINIMAL_PERSONA);
+    assert.equal(captured[1].systemText, MINIMAL_PERSONA);
+    assert.ok(
+      captured[1].userTexts.some((text) => (
+        text.includes("<v4-anchor-context>")
+        && text.includes("BASE LIVE SMOKE SYSTEM PROMPT")
+      )),
+      "the persistent continuation did not receive the original Pi prompt as user context",
+    );
     assert.deepEqual(captured[1].toolNames, ["read", "bash", "edit", "write"]);
     assert.equal(captured[1].maxOutputTokens, 2_048);
     assert.notEqual(captured[1].reasoning, undefined, "max thinking was not serialized on continuation");
@@ -227,6 +249,8 @@ try {
   }, null, 2));
 } finally {
   session?.dispose();
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   await Promise.all([
     rm(tempAgentDir, { recursive: true, force: true }),
     rm(tempProjectDir, { recursive: true, force: true }),

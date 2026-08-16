@@ -3,6 +3,7 @@ node_modules/
 coverage/
 *.tsbuildinfo
 *.tgz
+pi-v4-anchor-state.json
 *.log
 npm-debug.log*
 .DS_Store

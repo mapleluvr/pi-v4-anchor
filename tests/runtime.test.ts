@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AnchorPhase } from "../src/core.ts";
@@ -20,6 +22,9 @@ interface Runtime {
   notifications: Array<{ message: string; level: string }>;
   statuses: Map<string, string | undefined>;
 }
+
+type TestIntent = { enabled: boolean };
+const testIntents = new WeakMap<Runtime, TestIntent>();
 
 function createRuntime(initialEntries: any[] = [], model: any = targetModel()): Runtime {
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
@@ -73,7 +78,21 @@ function createRuntime(initialEntries: any[] = [], model: any = targetModel()): 
   };
 
   runtime.model = model;
+  testIntents.set(runtime, { enabled: false });
   return runtime;
+}
+
+function loadExtension(runtime: Runtime, intent = testIntents.get(runtime)!): void {
+  (extension as unknown as (pi: any, options?: {
+    intentStore: { read(): boolean; write(enabled: boolean): void };
+  }) => void)(runtime.pi, {
+    intentStore: {
+      read: () => intent.enabled,
+      write: (enabled) => {
+        intent.enabled = enabled;
+      },
+    },
+  });
 }
 
 function targetModel(api: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses", provider = "AnyGateway") {
@@ -118,7 +137,7 @@ function command(runtime: Runtime) {
 
 test("starts disabled and on/off restores the exact baseline tool set", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
 
@@ -137,9 +156,87 @@ test("starts disabled and on/off restores the exact baseline tool set", async ()
   assert.deepEqual(runtime.entries.at(-1)?.data, { enabled: false, phase: "off" });
 });
 
+test("shares /v4-anchor on with fresh target Pi instances through the agent state file", async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-v4-anchor-global-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+
+  try {
+    const parent = createRuntime();
+    extension(parent.pi);
+    const parentContext = createContext(parent);
+    await emit(parent, "session_start", { reason: "startup" }, parentContext);
+    await command(parent)("on", parentContext);
+
+    assert.equal(existsSync(join(agentDir, "pi-v4-anchor-state.json")), true);
+
+    const child = createRuntime();
+    extension(child.pi);
+    const childContext = createContext(child);
+    await emit(child, "session_start", { reason: "startup" }, childContext);
+    assert.deepEqual(child.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+    assert.match(child.statuses.get("v4-anchor") ?? "", /bootstrap/);
+
+    await command(parent)("off", parentContext);
+    const later = createRuntime();
+    extension(later.pi);
+    const laterContext = createContext(later);
+    await emit(later, "session_start", { reason: "startup" }, laterContext);
+    assert.deepEqual(later.activeTools, ["read", "bash", "edit", "write"]);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("arms a globally enabled fresh Pi only after it selects a target model", async () => {
+  const sharedIntent: TestIntent = { enabled: true };
+  const nonTarget = { provider: "OpenAI", id: "gpt-5", api: "openai-responses" };
+  const runtime = createRuntime([], nonTarget);
+  loadExtension(runtime, sharedIntent);
+  const ctx = createContext(runtime, nonTarget);
+  await emit(runtime, "session_start", { reason: "startup" }, ctx);
+
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
+  assert.match(runtime.statuses.get("v4-anchor") ?? "", /standby/);
+
+  const selected = targetModel("anthropic-messages", "child-provider");
+  ctx.model = selected;
+  await emit(runtime, "model_select", {
+    model: selected,
+    previousModel: nonTarget,
+    source: "set",
+  }, ctx);
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+  assert.match(runtime.statuses.get("v4-anchor") ?? "", /bootstrap/);
+});
+
+test("does not re-arm a stale branch after switching through a non-target model", async () => {
+  const runtime = createRuntime();
+  const intent = { enabled: true };
+  loadExtension(runtime, intent);
+  const target = targetModel("openai-responses", "provider-a");
+  const nonTarget = { provider: "OpenAI", id: "gpt-5", api: "openai-responses" };
+  const ctx = createContext(runtime, target);
+  await emit(runtime, "session_start", { reason: "startup" }, ctx);
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+
+  ctx.model = nonTarget;
+  await emit(runtime, "model_select", { model: nonTarget, previousModel: target, source: "set" }, ctx);
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
+
+  runtime.entries.push({ type: "message", message: { role: "user", content: "non-target work" } });
+  ctx.model = target;
+  await emit(runtime, "model_select", { model: target, previousModel: nonTarget, source: "set" }, ctx);
+
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
+  assert.match(runtime.statuses.get("v4-anchor") ?? "", /standby/);
+});
+
 test("preserves Magic Context tools while narrowing only the bootstrap payload", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const originalGetAllTools = runtime.pi.getAllTools;
   const magicToolNames = ["ctx_search", "ctx_memory", "ctx_note", "ctx_expand", "ctx_reduce", "todowrite"];
   runtime.activeTools.push(...magicToolNames);
@@ -189,7 +286,7 @@ test("preserves Magic Context tools while narrowing only the bootstrap payload",
 
 test("preserves an editor the user explicitly activated before on", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   runtime.pi.setActiveTools(["read", "bash", "edit", "write", "str_replace_editor"]);
@@ -212,7 +309,7 @@ test("preserves an editor the user explicitly activated before on", async () => 
 
 test("off is a no-op for user tools when anchor is already disabled", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   runtime.pi.setActiveTools(["read", "bash", "edit", "write", "str_replace_editor"]);
@@ -223,7 +320,7 @@ test("off is a no-op for user tools when anchor is already disabled", async () =
 
 test("refuses activation for another model or a non-fresh branch", async () => {
   const wrongModel = createRuntime([], { provider: "OpenAI", id: "gpt-5" });
-  extension(wrongModel.pi);
+  loadExtension(wrongModel);
   const wrongContext = createContext(wrongModel, wrongModel.model);
   await emit(wrongModel, "session_start", { reason: "startup" }, wrongContext);
   await command(wrongModel)("on", wrongContext);
@@ -233,24 +330,24 @@ test("refuses activation for another model or a non-fresh branch", async () => {
     id: "gateway/deepseek-v4-pro",
     api: "openai-completions",
   });
-  extension(aliased.pi);
+  loadExtension(aliased);
   const aliasedContext = createContext(aliased, aliased.model);
   await emit(aliased, "session_start", { reason: "startup" }, aliasedContext);
   await command(aliased)("on", aliasedContext);
   assert.deepEqual(aliased.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
 
   const existing = createRuntime([{ type: "message", message: { role: "user", content: "already started" } }]);
-  extension(existing.pi);
+  loadExtension(existing);
   const existingContext = createContext(existing);
   await emit(existing, "session_start", { reason: "startup" }, existingContext);
   await command(existing)("on", existingContext);
   assert.deepEqual(existing.activeTools, ["read", "bash", "edit", "write"]);
-  assert.match(existing.notifications.at(-1)?.message ?? "", /new session/i);
+  assert.match(existing.notifications.at(-1)?.message ?? "", /fresh target-model/i);
 });
 
 test("rewrites the first Responses request and promotes after a text-only assistant response", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   await command(runtime)("on", ctx);
@@ -291,26 +388,29 @@ test("rewrites the first Responses request and promotes after a text-only assist
     baselineTools: ["read", "bash", "edit", "write"],
   });
 
-  const nextTurnRequest = await emit(runtime, "before_provider_request", {
-    payload: {
-      input: [{ role: "system", content: "NEW TURN SYSTEM" }, { role: "user", content: "Continue" }],
-      tools: [],
-    },
-  }, ctx);
-  assert.deepEqual(nextTurnRequest, [undefined]);
-
   const laterAgent = await emit(runtime, "before_agent_start", {
     prompt: "Continue",
-    systemPrompt: "BASE PI SYSTEM PROMPT",
+    systemPrompt: "NEW TURN SYSTEM",
     systemPromptOptions: {},
   }, ctx);
-  assert.deepEqual(laterAgent, [undefined]);
+  assert.deepEqual(laterAgent, [{ systemPrompt: MINIMAL_PERSONA }]);
+
+  const nextTurnRequest = (await emit(runtime, "before_provider_request", {
+    payload: {
+      input: [{ role: "system", content: MINIMAL_PERSONA }, { role: "user", content: "Continue" }],
+      tools: [],
+    },
+  }, ctx))[0] as any;
+  assert.deepEqual(nextTurnRequest.input[0], { role: "system", content: MINIMAL_PERSONA });
+  assert.equal(nextTurnRequest.input[1].role, "user");
+  assert.match(JSON.stringify(nextTurnRequest.input[1]), /NEW TURN SYSTEM/);
+  assert.deepEqual(nextTurnRequest.input.at(-1), { role: "user", content: "Continue" });
 });
 
 test("rewrites Chat Completions and Anthropic Messages requests through the runtime lifecycle", async () => {
   for (const api of ["openai-completions", "anthropic-messages"] as const) {
     const runtime = createRuntime([], targetModel(api, "unrelated-provider"));
-    extension(runtime.pi);
+    loadExtension(runtime);
     const ctx = createContext(runtime, runtime.model);
     await emit(runtime, "session_start", { reason: "startup" }, ctx);
     await command(runtime)("on", ctx);
@@ -358,7 +458,7 @@ test("rewrites Chat Completions and Anthropic Messages requests through the runt
 
 test("does not restore old baseline tools after a promoted target-to-target model switch", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   await command(runtime)("on", ctx);
@@ -385,12 +485,12 @@ test("does not restore old baseline tools after a promoted target-to-target mode
     source: "set",
   }, ctx);
   assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "grep"]);
-  assert.match(runtime.statuses.get("v4-anchor") ?? "", /off/);
+  assert.match(runtime.statuses.get("v4-anchor") ?? "", /promoted/);
 });
 
 test("fails closed to the baseline request when bootstrap payload validation fails", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   await command(runtime)("on", ctx);
@@ -411,9 +511,9 @@ test("fails closed to the baseline request when bootstrap payload validation fai
   assert.match(runtime.notifications.at(-1)?.message ?? "", /payload validation failed/i);
 });
 
-test("restores the full baseline after a tool result and never overrides Pi bash", async () => {
+test("keeps the Minimal persona after a tool result and never overrides Pi bash", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   const fullPrompt = "BASE PI SYSTEM PROMPT\n\n<session-history>magic before anchor</session-history>";
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
@@ -451,16 +551,16 @@ test("restores the full baseline after a tool result and never overrides Pi bash
       tools: [],
     },
   }, ctx))[0] as any;
-  assert.deepEqual(continuation.input, [
-    { role: "system", content: fullPrompt },
-    { role: "user", content: "Continue" },
-  ]);
+  assert.deepEqual(continuation.input[0], { role: "system", content: MINIMAL_PERSONA });
+  assert.equal(continuation.input[1].role, "user");
+  assert.match(JSON.stringify(continuation.input[1]), /magic before anchor/);
+  assert.deepEqual(continuation.input.at(-1), { role: "user", content: "Continue" });
   assert.equal(runtime.tools.get("str_replace_editor")?.name, "str_replace_editor");
 });
 
-test("restores a Magic Context block appended after the anchor", async () => {
+test("moves a Magic Context block appended after the anchor into persistent user context", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   const magicBlock = "\n\n<session-history>magic after anchor</session-history>";
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
@@ -492,12 +592,14 @@ test("restores a Magic Context block appended after the anchor", async () => {
       tools: [],
     },
   }, ctx))[0] as any;
-  assert.equal(continuation.input[0].content, `BASE PI SYSTEM PROMPT${magicBlock}`);
+  assert.equal(continuation.input[0].content, MINIMAL_PERSONA);
+  assert.equal(continuation.input[1].role, "user");
+  assert.match(JSON.stringify(continuation.input[1]), /magic after anchor/);
 });
 
-test("disables the armed anchor when switching between target providers", async () => {
+test("keeps an armed anchor when switching between target providers", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime, {
     provider: "provider-a",
     id: "deepseek-v4-pro",
@@ -510,13 +612,17 @@ test("disables the armed anchor when switching between target providers", async 
     previousModel: { provider: "provider-a", id: "deepseek-v4-pro", api: "openai-completions" },
     source: "set",
   }, ctx);
-  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
-  assert.deepEqual(runtime.entries.at(-1)?.data, { enabled: false, phase: "off" });
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "bootstrap",
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
 });
 
 test("disables an armed anchor when the model or bash implementation changes", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   await command(runtime)("on", ctx);
@@ -532,7 +638,7 @@ test("disables an armed anchor when the model or bash implementation changes", a
   assert.deepEqual(runtime.entries.at(-1)?.data, { enabled: false, phase: "off" });
 
   const bashOverride = createRuntime();
-  extension(bashOverride.pi);
+  loadExtension(bashOverride);
   const bashContext = createContext(bashOverride);
   await emit(bashOverride, "session_start", { reason: "startup" }, bashContext);
   await command(bashOverride)("on", bashContext);
@@ -554,7 +660,7 @@ test("restores an armed state on reload only when the branch is still fresh", as
   const armed = createRuntime([
     { type: "custom", customType: "v4-anchor-state", data: { enabled: true, phase: "bootstrap" } },
   ]);
-  extension(armed.pi);
+  loadExtension(armed, { enabled: true });
   const armedContext = createContext(armed);
   await emit(armed, "session_start", { reason: "resume" }, armedContext);
   assert.deepEqual(armed.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
@@ -563,16 +669,16 @@ test("restores an armed state on reload only when the branch is still fresh", as
     { type: "message", message: { role: "user", content: "already sent" } },
     { type: "custom", customType: "v4-anchor-state", data: { enabled: true, phase: "bootstrap" } },
   ]);
-  extension(stale.pi);
+  loadExtension(stale, { enabled: true });
   const staleContext = createContext(stale);
   await emit(stale, "session_start", { reason: "resume" }, staleContext);
   assert.deepEqual(stale.activeTools, ["read", "bash", "edit", "write"]);
-  assert.match(stale.notifications.at(-1)?.message ?? "", /disabled/i);
+  assert.match(stale.notifications.at(-1)?.message ?? "", /closed/i);
 });
 
 test("disables an armed anchor on compaction and restores tools before session replacement", async () => {
   const compacted = createRuntime();
-  extension(compacted.pi);
+  loadExtension(compacted);
   const compactedContext = createContext(compacted);
   await emit(compacted, "session_start", { reason: "startup" }, compactedContext);
   await command(compacted)("on", compactedContext);
@@ -581,7 +687,7 @@ test("disables an armed anchor on compaction and restores tools before session r
   assert.deepEqual(compacted.entries.at(-1)?.data, { enabled: false, phase: "off" });
 
   const replaced = createRuntime();
-  extension(replaced.pi);
+  loadExtension(replaced);
   const replacedContext = createContext(replaced);
   await emit(replaced, "session_start", { reason: "startup" }, replacedContext);
   await command(replaced)("on", replacedContext);
@@ -610,7 +716,7 @@ test("keeps a promoted target-model branch promoted across reload and fork", asy
     ];
     const runtime = createRuntime(entries);
     runtime.activeTools = ["bash", "str_replace_editor"];
-    extension(runtime.pi);
+    loadExtension(runtime, { enabled: true });
     const ctx = createContext(runtime);
 
     await emit(runtime, "session_start", { reason }, ctx);
@@ -626,12 +732,14 @@ test("keeps a promoted target-model branch promoted across reload and fork", asy
 
 test("rebuilds armed and off state when navigating the session tree", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  const intent = { enabled: false };
+  loadExtension(runtime, intent);
   let branch: any[] = [];
   const ctx = createContext(runtime, targetModel(), branch);
   ctx.sessionManager.getBranch = () => branch;
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
 
+  intent.enabled = true;
   branch = [{
     type: "custom",
     customType: "v4-anchor-state",
@@ -645,6 +753,7 @@ test("rebuilds armed and off state when navigating the session tree", async () =
   assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
   assert.match(runtime.statuses.get("v4-anchor") ?? "", /bootstrap/);
 
+  intent.enabled = false;
   branch = [{
     type: "custom",
     customType: "v4-anchor-state",
@@ -657,7 +766,7 @@ test("rebuilds armed and off state when navigating the session tree", async () =
 
 test("leaves another extension's editor active while refusing anchor activation", async () => {
   const runtime = createRuntime();
-  extension(runtime.pi);
+  loadExtension(runtime);
   const getAllTools = runtime.pi.getAllTools;
   runtime.pi.getAllTools = () => getAllTools().map((tool: any) => tool.name === "str_replace_editor"
     ? {
@@ -684,7 +793,7 @@ test("refuses activation if another extension has replaced Pi's bash", async () 
       ? { ...tool, sourceInfo: { source: "other-extension", path: "other.ts" } }
       : tool),
   ];
-  extension(runtime.pi);
+  loadExtension(runtime);
   const ctx = createContext(runtime);
   await emit(runtime, "session_start", { reason: "startup" }, ctx);
   await command(runtime)("on", ctx);

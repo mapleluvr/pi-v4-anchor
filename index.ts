@@ -17,10 +17,11 @@ import {
   readAnchorSnapshot,
   restoreSystemPrompt,
   rewriteBootstrapPayload,
-  type AnchorPhase,
+  rewritePersistentPayload,
   type AnchorApi,
   type AnchorState,
 } from "./src/core.ts";
+import { FileAnchorIntentStore, type AnchorIntentStore } from "./src/intent.ts";
 import { EDITOR_DESCRIPTION, executeEditor } from "./src/editor.ts";
 
 const STATUS_KEY = "v4-anchor";
@@ -49,7 +50,6 @@ type AnyContext = ExtensionContext | ExtensionCommandContext;
 
 type ToolInfoLike = {
   name?: string;
-  description?: string;
   sourceInfo?: {
     path?: string;
     source?: string;
@@ -62,8 +62,18 @@ type AssistantLike = {
   stopReason?: string;
 };
 
-function statusText(state: AnchorState): string {
-  return `v4-anchor:${state.enabled ? state.phase : "off"}`;
+export interface PiV4AnchorOptions {
+  intentStore?: AnchorIntentStore;
+}
+
+function statusText(state: AnchorState, desiredEnabled: boolean, model: unknown): string {
+  if (!desiredEnabled) return "v4-anchor:off";
+  if (!isTargetModel(model) || !state.enabled || state.phase === "off") {
+    return "v4-anchor:standby";
+  }
+  return state.phase === "promoted"
+    ? "v4-anchor:promoted:persistent"
+    : `v4-anchor:${state.phase}`;
 }
 
 function notify(ctx: AnyContext, message: string, level: "info" | "warning" | "error"): void {
@@ -104,14 +114,15 @@ function branchEntries(ctx: AnyContext): readonly unknown[] {
   return ctx.sessionManager.getBranch();
 }
 
-export default function piV4Anchor(pi: ExtensionAPI): void {
+export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions = {}): void {
+  const intentStore = options.intentStore ?? new FileAnchorIntentStore();
+  let desiredEnabled = intentStore.read();
   let state: AnchorState = { enabled: false, phase: "off" };
   let baselineTools: string[] | undefined;
   let baselineSystemPrompt: string | undefined;
-  let restoreSystemForNextRequest = false;
 
-  function updateStatus(ctx: AnyContext): void {
-    ctx.ui.setStatus(STATUS_KEY, statusText(state));
+  function updateStatus(ctx: AnyContext, model: unknown = ctx.model): void {
+    ctx.ui.setStatus(STATUS_KEY, statusText(state, desiredEnabled, model));
   }
 
   function persistState(ctx: AnyContext): void {
@@ -126,6 +137,27 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
     state = next.enabled ? { ...next } : { enabled: false, phase: "off" };
     if (persist) persistState(ctx);
     else updateStatus(ctx);
+  }
+
+  function refreshDesiredIntent(): boolean {
+    try {
+      desiredEnabled = intentStore.read();
+    } catch {
+      desiredEnabled = false;
+    }
+    return desiredEnabled;
+  }
+
+  function writeDesiredIntent(enabled: boolean, ctx: AnyContext): boolean {
+    try {
+      intentStore.write(enabled);
+      desiredEnabled = enabled;
+      return true;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      notify(ctx, `V4 anchor could not update its shared enablement state: ${reason}`, "error");
+      return false;
+    }
   }
 
   function ownsEditorDefinition(): boolean {
@@ -143,7 +175,7 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
     return captureCurrentTools().filter((name) => name !== "str_replace_editor" || !removeAnchorEditor);
   }
 
-  function restoreTools(piContext: AnyContext): void {
+  function restoreTools(ctx: AnyContext): void {
     const tools = baselineTools ?? captureDefaultBaselineTools();
     baselineTools = [...tools];
     pi.setActiveTools(tools);
@@ -155,14 +187,8 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
     pi.setActiveTools(tools);
   }
 
-  function checkTargetModel(ctx: AnyContext): boolean {
-    if (isTargetModel(ctx.model)) return true;
-    notify(
-      ctx,
-      "V4 anchor requires a model id ending in deepseek-v4-pro and an OpenAI Responses, Chat Completions, or Anthropic Messages API; it was not enabled.",
-      "warning",
-    );
-    return false;
+  function isArmed(): boolean {
+    return state.enabled && (state.phase === "bootstrap" || state.phase === "in-flight");
   }
 
   function checkBashAndEditorAvailability(ctx: AnyContext): boolean {
@@ -199,7 +225,7 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
       label: "str_replace_editor",
       description: EDITOR_DESCRIPTION,
       parameters: EDITOR_PARAMETERS,
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         const result = await executeEditor(params as EditorParameters, {
           maxOutputChars: EDITOR_MAX_OUTPUT_CHARS,
           signal,
@@ -215,91 +241,134 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
 
   registerEditorTool();
 
+  function clearLocalState(ctx: AnyContext, persist = true): void {
+    const wasEnabled = state.enabled;
+    if (isArmed()) restoreTools(ctx);
+    baselineSystemPrompt = undefined;
+    baselineTools = undefined;
+    if (wasEnabled) setState({ enabled: false, phase: "off" }, ctx, persist);
+    else updateStatus(ctx);
+  }
+
+  function armFreshTarget(ctx: AnyContext, model: unknown, persist = true): boolean {
+    if (!desiredEnabled || !isTargetModel(model)) return false;
+    if (state.enabled && state.phase !== "off") {
+      if (isArmed()) setArmedTools();
+      updateStatus(ctx, model);
+      return true;
+    }
+    if (hasConversation(branchEntries(ctx))) {
+      updateStatus(ctx, model);
+      return false;
+    }
+    if (!checkBashAndEditorAvailability(ctx)) {
+      updateStatus(ctx, model);
+      return false;
+    }
+
+    baselineTools = captureCurrentTools();
+    baselineSystemPrompt = ctx.getSystemPrompt();
+    setArmedTools();
+    setState({ enabled: true, phase: "bootstrap" }, ctx, persist);
+    return true;
+  }
+
+  function reconcileForModel(ctx: AnyContext, model: unknown = ctx.model, allowFreshArm = true): void {
+    refreshDesiredIntent();
+    if (!desiredEnabled) {
+      clearLocalState(ctx);
+      return;
+    }
+
+    if (!isTargetModel(model)) {
+      if (isArmed()) clearLocalState(ctx);
+      updateStatus(ctx, model);
+      return;
+    }
+
+    if (state.enabled && state.phase === "promoted") {
+      updateStatus(ctx, model);
+      return;
+    }
+    if (isArmed()) {
+      setArmedTools();
+      updateStatus(ctx, model);
+      return;
+    }
+    if (allowFreshArm) armFreshTarget(ctx, model);
+    else updateStatus(ctx, model);
+  }
+
   async function waitForIdle(ctx: ExtensionCommandContext): Promise<void> {
     await ctx.waitForIdle();
   }
 
   async function activate(ctx: ExtensionCommandContext): Promise<void> {
     await waitForIdle(ctx);
-    if (!checkTargetModel(ctx)) return;
-    if (hasConversation(branchEntries(ctx))) {
-      notify(ctx, "V4 anchor can only be enabled in a new session before its first message.", "warning");
+    if (!writeDesiredIntent(true, ctx)) return;
+
+    if (!isTargetModel(ctx.model)) {
+      updateStatus(ctx);
+      notify(ctx, "V4 anchor is enabled for every Pi instance; this model is on standby until its id ends in deepseek-v4-pro.", "info");
       return;
     }
     if (state.enabled && state.phase !== "off") {
+      reconcileForModel(ctx);
       notify(ctx, `V4 anchor is already ${state.phase}.`, "info");
       return;
     }
-    if (!checkBashAndEditorAvailability(ctx)) return;
-
-    baselineTools = captureCurrentTools();
-    baselineSystemPrompt = ctx.getSystemPrompt();
-    setArmedTools();
-    restoreSystemForNextRequest = false;
-    setState({ enabled: true, phase: "bootstrap" }, ctx);
-    notify(ctx, "V4 anchor armed for the next request.", "info");
+    if (!armFreshTarget(ctx, ctx.model)) {
+      if (hasConversation(branchEntries(ctx))) {
+        notify(ctx, "V4 anchor is enabled globally and will arm fresh target-model sessions.", "info");
+      }
+      return;
+    }
+    notify(ctx, "V4 anchor is enabled globally and armed for the next request.", "info");
   }
 
   async function deactivate(ctx: ExtensionCommandContext, announce = true): Promise<void> {
     await waitForIdle(ctx);
-    const wasArmed = state.enabled && (state.phase === "bootstrap" || state.phase === "in-flight");
-    if (!state.enabled) {
-      restoreSystemForNextRequest = false;
-      updateStatus(ctx);
-      if (announce) notify(ctx, "V4 anchor is already disabled.", "info");
-      return;
+    const wasDesired = desiredEnabled;
+    if (!writeDesiredIntent(false, ctx)) return;
+    const wasEnabled = state.enabled;
+    clearLocalState(ctx);
+    if (announce) {
+      notify(
+        ctx,
+        wasDesired || wasEnabled
+          ? "V4 anchor was disabled for this and future Pi instances."
+          : "V4 anchor is already disabled.",
+        "info",
+      );
     }
-    if (wasArmed) restoreTools(ctx);
-    restoreSystemForNextRequest = false;
-    setState({ enabled: false, phase: "off" }, ctx);
-    baselineTools = undefined;
-    baselineSystemPrompt = undefined;
-    if (announce) notify(ctx, "V4 anchor disabled and the previous tool set was restored.", "info");
   }
 
   function describeStatus(ctx: ExtensionCommandContext): void {
+    refreshDesiredIntent();
     const target = isTargetModel(ctx.model) ? "target model" : "inactive model";
-    notify(ctx, `${statusText(state)} (${target})`, "info");
+    const intent = desiredEnabled ? "global enablement on" : "global enablement off";
+    notify(ctx, `${statusText(state, desiredEnabled, ctx.model)} (${target}; ${intent})`, "info");
   }
 
-  function sameTargetModel(left: unknown, right: unknown): boolean {
-    if (!isTargetModel(left) || !isTargetModel(right)) return false;
-    const leftModel = left as { provider?: unknown; id: string; api: AnchorApi };
-    const rightModel = right as { provider?: unknown; id: string; api: AnchorApi };
-    return leftModel.provider === rightModel.provider
-      && leftModel.id === rightModel.id
-      && leftModel.api === rightModel.api;
-  }
-
-  function restoreIfModelChanged(
-    eventModel: unknown,
-    ctx: ExtensionContext,
-    previousModel?: unknown,
-  ): void {
-    if (!state.enabled) return;
-    const sameSelectedModel = previousModel === undefined
-      ? isTargetModel(eventModel)
-      : sameTargetModel(eventModel, previousModel);
-    if (sameSelectedModel) return;
-    const wasArmed = state.phase === "bootstrap" || state.phase === "in-flight";
-    if (wasArmed) restoreTools(ctx);
-    restoreSystemForNextRequest = false;
-    setState({ enabled: false, phase: "off" }, ctx);
-    baselineTools = undefined;
-    baselineSystemPrompt = undefined;
-    notify(ctx, "V4 anchor disabled because the active model changed.", "warning");
-  }
-
-  function promote(ctx: ExtensionContext, restoreOnNextProviderRequest: boolean): void {
+  function promote(ctx: ExtensionContext): void {
     if (!state.enabled || state.phase === "promoted") return;
     restoreTools(ctx);
-    restoreSystemForNextRequest = restoreOnNextProviderRequest;
-    if (!restoreOnNextProviderRequest) baselineSystemPrompt = undefined;
     setState({ enabled: true, phase: "promoted" }, ctx);
   }
 
+  function disableForPayloadFailure(ctx: ExtensionContext, reason: string, payload: unknown, api: AnchorApi | undefined): unknown {
+    const systemPrompt = baselineSystemPrompt ?? ctx.getSystemPrompt();
+    clearLocalState(ctx);
+    notify(ctx, `V4 anchor payload validation failed for this branch: ${reason}`, "error");
+    try {
+      return restoreSystemPrompt(payload, systemPrompt, api);
+    } catch {
+      return payload;
+    }
+  }
+
   pi.registerCommand("v4-anchor", {
-    description: "Arm, disarm, or inspect the DeepSeek V4 Pro trajectory anchor",
+    description: "Globally enable, disable, or inspect the DeepSeek V4 Pro trajectory anchor",
     getArgumentCompletions: (argumentPrefix) => {
       const values = ["on", "off", "status"];
       return values
@@ -324,7 +393,7 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     reason: "startup" | "reload" | "new" | "resume" | "fork" | "tree",
   ): void {
-    const previousWasArmed = state.enabled && (state.phase === "bootstrap" || state.phase === "in-flight");
+    const previousWasArmed = isArmed();
     const previousBaseline = baselineTools;
     const snapshot = readAnchorSnapshot(branchEntries(ctx));
     state = snapshot.state;
@@ -338,40 +407,42 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
       : [...snapshot.baselineTools];
     restoreTools(ctx);
     baselineSystemPrompt = ctx.getSystemPrompt();
-    restoreSystemForNextRequest = false;
+    refreshDesiredIntent();
 
-    if (!state.enabled || state.phase === "off") {
+    if (!desiredEnabled) {
+      if (state.enabled) clearLocalState(ctx);
+      else updateStatus(ctx);
+      return;
+    }
+
+    if (state.enabled && state.phase === "promoted") {
       updateStatus(ctx);
       return;
     }
 
     if (!isTargetModel(ctx.model)) {
-      setState({ enabled: false, phase: "off" }, ctx);
-      baselineSystemPrompt = undefined;
-      notify(ctx, "V4 anchor was disabled because the selected branch does not use the target model.", "warning");
-      return;
-    }
-
-    if (state.phase === "promoted") {
-      baselineSystemPrompt = undefined;
+      if (isArmed()) restoreTools(ctx);
       updateStatus(ctx);
       return;
     }
 
-    if (reason === "fork" || hasConversation(branchEntries(ctx))) {
-      setState({ enabled: false, phase: "off" }, ctx);
-      baselineSystemPrompt = undefined;
-      notify(ctx, "V4 anchor was disabled because this branch is not fresh.", "warning");
+    if (isArmed()) {
+      if (reason === "fork" || hasConversation(branchEntries(ctx))) {
+        clearLocalState(ctx);
+        notify(ctx, "V4 anchor was closed for this branch because it is not fresh.", "warning");
+        return;
+      }
+      if (!checkBashAndEditorAvailability(ctx)) {
+        clearLocalState(ctx);
+        return;
+      }
+      setArmedTools();
+      updateStatus(ctx);
       return;
     }
 
-    if (!checkBashAndEditorAvailability(ctx)) {
-      setState({ enabled: false, phase: "off" }, ctx);
-      baselineSystemPrompt = undefined;
-      return;
-    }
-    setArmedTools();
-    updateStatus(ctx);
+    if (reason !== "fork") armFreshTarget(ctx, ctx.model);
+    else updateStatus(ctx);
   }
 
   pi.on("session_start", (event, ctx) => {
@@ -383,29 +454,23 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", (_event, ctx) => {
-    if (!state.enabled || (state.phase !== "bootstrap" && state.phase !== "in-flight")) return;
-    restoreTools(ctx);
-    restoreSystemForNextRequest = false;
-    baselineSystemPrompt = undefined;
-    setState({ enabled: false, phase: "off" }, ctx);
-    notify(ctx, "V4 anchor was disabled because compaction changed the session trajectory.", "warning");
+    if (!isArmed()) return;
+    clearLocalState(ctx);
+    notify(ctx, "V4 anchor was closed for this branch because compaction changed the session trajectory.", "warning");
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    if (state.enabled && (state.phase === "bootstrap" || state.phase === "in-flight")) {
-      restoreTools(ctx);
-    }
-    restoreSystemForNextRequest = false;
+    if (isArmed()) restoreTools(ctx);
     baselineSystemPrompt = undefined;
   });
 
-    pi.on("model_select", (event, ctx) => {
-    restoreIfModelChanged(event.model, ctx, event.previousModel);
+  pi.on("model_select", (event, ctx) => {
+    reconcileForModel(ctx, event.model);
   });
 
   pi.on("before_agent_start", (event, ctx) => {
-    if (!state.enabled || (state.phase !== "bootstrap" && state.phase !== "in-flight")) return;
-    if (!isTargetModel(ctx.model)) return;
+    reconcileForModel(ctx);
+    if (!desiredEnabled || !state.enabled || !isTargetModel(ctx.model)) return;
     if (event.systemPrompt && event.systemPrompt !== MINIMAL_PERSONA) {
       baselineSystemPrompt = event.systemPrompt;
     }
@@ -413,24 +478,30 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (!state.enabled) return;
+    refreshDesiredIntent();
     const model = ctx.model;
-    if (!model || !isTargetModel(model)) {
-      restoreIfModelChanged(model, ctx);
+    if (!desiredEnabled) {
+      clearLocalState(ctx);
       return;
     }
-    if ((state.phase === "bootstrap" || state.phase === "in-flight") && !checkBashAndEditorAvailability(ctx)) {
-      restoreTools(ctx);
-      restoreSystemForNextRequest = false;
-      setState({ enabled: false, phase: "off" }, ctx);
-      baselineTools = undefined;
-      baselineSystemPrompt = undefined;
+    if (!model || !isTargetModel(model)) {
+      if (isArmed()) clearLocalState(ctx);
+      else updateStatus(ctx, model);
       return;
     }
 
-    if (state.phase === "bootstrap" || state.phase === "in-flight") {
+    if (!state.enabled) {
+      armFreshTarget(ctx, model);
+      if (!state.enabled) return;
+    }
+
+    const api = apiForModel(model);
+    if (isArmed()) {
+      if (!checkBashAndEditorAvailability(ctx)) {
+        clearLocalState(ctx);
+        return;
+      }
       try {
-        const api = apiForModel(model);
         baselineSystemPrompt = captureContinuationSystemPrompt(
           event.payload,
           baselineSystemPrompt ?? ctx.getSystemPrompt(),
@@ -446,29 +517,26 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
         }
         return rewritten;
       } catch (error) {
-        const systemPrompt = baselineSystemPrompt ?? ctx.getSystemPrompt();
-        restoreTools(ctx);
-        restoreSystemForNextRequest = false;
-        setState({ enabled: false, phase: "off" }, ctx);
-        baselineTools = undefined;
-        baselineSystemPrompt = undefined;
         const reason = error instanceof Error ? error.message : String(error);
-        notify(ctx, `V4 anchor payload validation failed and was disabled: ${reason}`, "error");
-        try {
-          return restoreSystemPrompt(event.payload, systemPrompt, apiForModel(model));
-        } catch {
-          return event.payload;
-        }
+        return disableForPayloadFailure(ctx, reason, event.payload, api);
       }
     }
 
-    if (state.phase === "promoted" && restoreSystemForNextRequest) {
-      restoreSystemForNextRequest = false;
-      return restoreSystemPrompt(
-        event.payload,
-        baselineSystemPrompt ?? ctx.getSystemPrompt(),
-        apiForModel(model),
-      );
+    if (state.phase === "promoted") {
+      try {
+        baselineSystemPrompt = captureContinuationSystemPrompt(
+          event.payload,
+          baselineSystemPrompt ?? ctx.getSystemPrompt(),
+          api,
+        );
+        return rewritePersistentPayload(event.payload, {
+          api,
+          context: baselineSystemPrompt,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return disableForPayloadFailure(ctx, reason, event.payload, api);
+      }
     }
   });
 
@@ -487,21 +555,17 @@ export default function piV4Anchor(pi: ExtensionAPI): void {
       setState({ enabled: true, phase: "bootstrap" }, ctx);
       return;
     }
-    promote(ctx, false);
+    promote(ctx);
   });
 
   pi.on("tool_result", (_event, ctx) => {
     if (!state.enabled || state.phase !== "in-flight") return;
-    promote(ctx, true);
+    promote(ctx);
   });
 
   pi.on("agent_end", (_event, ctx) => {
     if (state.enabled && state.phase === "in-flight") {
       setState({ enabled: true, phase: "bootstrap" }, ctx);
-    }
-    if (restoreSystemForNextRequest) {
-      restoreSystemForNextRequest = false;
-      baselineSystemPrompt = undefined;
     }
   });
 }

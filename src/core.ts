@@ -201,22 +201,46 @@ function restoreAnthropicSystem(value: unknown, systemPrompt: string): unknown {
   });
 }
 
-function serializedSystemText(payload: JsonRecord, api: AnchorApi): string | undefined {
-  const value = api === "anthropic-messages"
-    ? payload.system
-    : (() => {
-      const items = Array.isArray(payload.input) ? payload.input : payload.messages;
-      if (!Array.isArray(items)) return payload.instructions;
-      const systemItem = items.find((item) => (
-        isRecord(item) && (item.role === "system" || item.role === "developer")
-      ));
-      return isRecord(systemItem) ? systemItem.content : payload.instructions;
-    })();
-
+function serializedContentText(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return undefined;
-  const textPart = value.find((part) => isRecord(part) && typeof part.text === "string");
-  return isRecord(textPart) && typeof textPart.text === "string" ? textPart.text : undefined;
+  const texts = value.flatMap((part) => (
+    isRecord(part) && typeof part.text === "string" ? [part.text] : []
+  ));
+  return texts.length > 0 ? texts.join("\n\n") : undefined;
+}
+
+function joinSystemTexts(values: readonly unknown[]): string | undefined {
+  const texts = values.flatMap((value) => {
+    const text = serializedContentText(value);
+    return text === undefined ? [] : [text];
+  });
+  return texts.length > 0 ? texts.join("\n\n") : undefined;
+}
+
+function serializedSystemText(payload: JsonRecord, api: AnchorApi): string | undefined {
+  if (api === "anthropic-messages") {
+    return serializedContentText(payload.system);
+  }
+
+  const items = Array.isArray(payload.input) ? payload.input : payload.messages;
+  if (!Array.isArray(items)) return serializedContentText(payload.instructions);
+  const systemContents = items.flatMap((item) => (
+    isRecord(item) && (item.role === "system" || item.role === "developer")
+      ? [item.content]
+      : []
+  ));
+  return joinSystemTexts(systemContents) ?? serializedContentText(payload.instructions);
+}
+
+function appendNonOverlappingSuffix(base: string, suffix: string): string {
+  const maximumOverlap = Math.min(base.length, suffix.length);
+  for (let overlap = maximumOverlap; overlap > 0; overlap -= 1) {
+    if (base.endsWith(suffix.slice(0, overlap))) {
+      return `${base}${suffix.slice(overlap)}`;
+    }
+  }
+  return `${base}${suffix}`;
 }
 
 export function captureContinuationSystemPrompt(
@@ -231,7 +255,7 @@ export function captureContinuationSystemPrompt(
   const observed = serializedSystemText(payload, resolvedApi);
   if (!observed || observed === MINIMAL_PERSONA) return baselineSystemPrompt;
   if (observed.startsWith(MINIMAL_PERSONA)) {
-    return `${baselineSystemPrompt}${observed.slice(MINIMAL_PERSONA.length)}`;
+    return appendNonOverlappingSuffix(baselineSystemPrompt, observed.slice(MINIMAL_PERSONA.length));
   }
   return observed;
 }
@@ -270,6 +294,86 @@ export function restoreSystemPrompt(
     return restored;
   }
   throw new Error("Provider payload API is not supported by v4-anchor");
+}
+
+export interface PersistentPayloadOptions {
+  api?: AnchorApi;
+  context: string;
+}
+
+function persistentContextText(context: string): string {
+  return `<v4-anchor-context>\n${context}\n</v4-anchor-context>`;
+}
+
+function persistentContextItem(api: AnchorApi, context: string): JsonRecord {
+  const text = persistentContextText(context);
+  if (api === "openai-responses") {
+    return {
+      role: "user",
+      content: [{ type: "input_text", text }],
+    };
+  }
+  if (api === "anthropic-messages") {
+    return {
+      role: "user",
+      content: [{ type: "text", text }],
+    };
+  }
+  return { role: "user", content: text };
+}
+
+function insertPersistentContext(items: unknown[], api: AnchorApi, context: string): unknown[] {
+  const systemIndex = items.findIndex((item) => (
+    isRecord(item) && (item.role === "system" || item.role === "developer")
+  ));
+  const index = systemIndex < 0 ? 0 : systemIndex + 1;
+  return [
+    ...items.slice(0, index),
+    persistentContextItem(api, context),
+    ...items.slice(index),
+  ];
+}
+
+export function rewritePersistentPayload(
+  payload: unknown,
+  options: PersistentPayloadOptions,
+): unknown {
+  if (!isRecord(payload)) throw new Error("Provider payload must be an object");
+  if (typeof options.context !== "string" || options.context.length === 0) {
+    throw new Error("persistent anchor context must be a non-empty string");
+  }
+  const api = options.api ?? detectPayloadApi(payload);
+  if (!api || !isAnchorApi(api)) {
+    throw new Error("Provider payload API is not supported by v4-anchor");
+  }
+
+  const rewritten: JsonRecord = { ...payload };
+  if (api === "anthropic-messages") {
+    if (!Array.isArray(payload.messages)) {
+      throw new Error("Provider payload does not contain a messages array");
+    }
+    rewritten.system = rewriteAnthropicSystem(payload.system, MINIMAL_PERSONA);
+    rewritten.messages = [
+      persistentContextItem(api, options.context),
+      ...payload.messages,
+    ];
+    delete rewritten.instructions;
+    delete rewritten.input;
+    return rewritten;
+  }
+
+  const field = api === "openai-responses" ? "input" : "messages";
+  const items = payload[field];
+  if (!Array.isArray(items)) {
+    throw new Error(`Provider payload does not contain a ${field} array`);
+  }
+  const minimalItems = rewriteSystemItems(items, MINIMAL_PERSONA);
+  rewritten[field] = insertPersistentContext(minimalItems, api, options.context);
+  if ("instructions" in payload) rewritten.instructions = MINIMAL_PERSONA;
+  delete rewritten.system;
+  if (api === "openai-responses") delete rewritten.messages;
+  else delete rewritten.input;
+  return rewritten;
 }
 
 export const ANCHOR_STATE_ENTRY = "v4-anchor-state";
