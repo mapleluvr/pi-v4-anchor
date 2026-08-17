@@ -104,7 +104,7 @@ test("shares global enablement across independent Pi SDK sessions and restores i
     assert.deepEqual(session.getActiveToolNames(), [...baselineTools, "str_replace_editor"]);
     assert.deepEqual((session.sessionManager.getBranch().at(-1) as any)?.data?.baselineTools, baselineTools);
     assert.deepEqual(JSON.parse(await readFile(join(agentDir, "pi-v4-anchor-state.json"), "utf8")), {
-      version: 1,
+      version: 2,
       enabled: true,
     });
 
@@ -134,7 +134,7 @@ test("shares global enablement across independent Pi SDK sessions and restores i
     await child.reload();
     assert.deepEqual(child.getActiveToolNames(), baselineTools);
     assert.deepEqual(JSON.parse(await readFile(join(agentDir, "pi-v4-anchor-state.json"), "utf8")), {
-      version: 1,
+      version: 2,
       enabled: false,
     });
   } finally {

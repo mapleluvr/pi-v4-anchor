@@ -23,7 +23,11 @@ interface Runtime {
   statuses: Map<string, string | undefined>;
 }
 
-type TestIntent = { enabled: boolean };
+type TestIntent = {
+  enabled: boolean;
+  hold?: true;
+  minThinkingTokens?: number;
+};
 const testIntents = new WeakMap<Runtime, TestIntent>();
 
 function createRuntime(initialEntries: any[] = [], model: any = targetModel()): Runtime {
@@ -84,12 +88,17 @@ function createRuntime(initialEntries: any[] = [], model: any = targetModel()): 
 
 function loadExtension(runtime: Runtime, intent = testIntents.get(runtime)!): void {
   (extension as unknown as (pi: any, options?: {
-    intentStore: { read(): boolean; write(enabled: boolean): void };
+    intentStore: {
+      read(): TestIntent;
+      write(intent: TestIntent): void;
+    };
   }) => void)(runtime.pi, {
     intentStore: {
-      read: () => intent.enabled,
-      write: (enabled) => {
-        intent.enabled = enabled;
+      read: () => ({ ...intent }),
+      write: (next) => {
+        intent.enabled = next.enabled;
+        intent.hold = next.hold;
+        intent.minThinkingTokens = next.minThinkingTokens;
       },
     },
   });
@@ -156,7 +165,7 @@ test("starts disabled and on/off restores the exact baseline tool set", async ()
   assert.deepEqual(runtime.entries.at(-1)?.data, { enabled: false, phase: "off" });
 });
 
-test("shares /v4-anchor on with fresh target Pi instances through the agent state file", async () => {
+test("shares /v4-anchor threshold settings with fresh target Pi instances through the agent state file", async () => {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-v4-anchor-global-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -166,7 +175,7 @@ test("shares /v4-anchor on with fresh target Pi instances through the agent stat
     extension(parent.pi);
     const parentContext = createContext(parent);
     await emit(parent, "session_start", { reason: "startup" }, parentContext);
-    await command(parent)("on", parentContext);
+    await command(parent)("on --min-thinking-tokens 2048", parentContext);
 
     assert.equal(existsSync(join(agentDir, "pi-v4-anchor-state.json")), true);
 
@@ -176,6 +185,13 @@ test("shares /v4-anchor on with fresh target Pi instances through the agent stat
     await emit(child, "session_start", { reason: "startup" }, childContext);
     assert.deepEqual(child.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
     assert.match(child.statuses.get("v4-anchor") ?? "", /bootstrap/);
+    assert.deepEqual(child.entries.at(-1)?.data, {
+      enabled: true,
+      phase: "bootstrap",
+      minThinkingTokens: 2048,
+      thinkingTokens: 0,
+      baselineTools: ["read", "bash", "edit", "write"],
+    });
 
     await command(parent)("off", parentContext);
     const later = createRuntime();
@@ -405,6 +421,161 @@ test("rewrites the first Responses request and promotes after a text-only assist
   assert.equal(nextTurnRequest.input[1].role, "user");
   assert.match(JSON.stringify(nextTurnRequest.input[1]), /NEW TURN SYSTEM/);
   assert.deepEqual(nextTurnRequest.input.at(-1), { role: "user", content: "Continue" });
+});
+
+test("hold keeps the Minimal tool surface until manual promotion", async () => {
+  const runtime = createRuntime();
+  loadExtension(runtime);
+  const ctx = createContext(runtime);
+  await emit(runtime, "session_start", { reason: "startup" }, ctx);
+  await command(runtime)("hold", ctx);
+
+  await emit(runtime, "before_provider_request", {
+    payload: {
+      input: [
+        { role: "system", content: MINIMAL_PERSONA },
+        { role: "user", content: "Implement the task" },
+      ],
+      tools: [
+        { type: "function", name: "bash", description: "bash", parameters: {} },
+        { type: "function", name: "str_replace_editor", description: "editor", parameters: {} },
+        { type: "function", name: "read", description: "read", parameters: {} },
+      ],
+    },
+  }, ctx);
+  await emit(runtime, "message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Need another turn" }],
+      stopReason: "stop",
+      usage: { reasoning: 512 },
+    },
+  }, ctx);
+
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "anchored",
+    hold: true,
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
+
+  const continuation = (await emit(runtime, "before_provider_request", {
+    payload: {
+      input: [
+        { role: "system", content: "BASE PI SYSTEM PROMPT" },
+        { role: "user", content: "Implement the task" },
+        { role: "assistant", content: "Need another turn" },
+        { role: "user", content: "Continue" },
+      ],
+      tools: [
+        { type: "function", name: "read", description: "read", parameters: {} },
+        { type: "function", name: "bash", description: "bash", parameters: {} },
+        { type: "function", name: "str_replace_editor", description: "editor", parameters: {} },
+      ],
+      max_output_tokens: 4096,
+    },
+  }, ctx))[0] as any;
+
+  assert.deepEqual(continuation.tools.map((tool: any) => tool.name), ["bash", "str_replace_editor"]);
+  assert.deepEqual(continuation.input.slice(1), [
+    { role: "user", content: "Implement the task" },
+    { role: "assistant", content: "Need another turn" },
+    { role: "user", content: "Continue" },
+  ]);
+  assert.equal(continuation.input[0].content, MINIMAL_PERSONA);
+  assert.equal(continuation.max_output_tokens, 4096);
+
+  await command(runtime)("promote", ctx);
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "promoted",
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
+});
+
+test("promotes on the request after cumulative reasoning exceeds the configured threshold", async () => {
+  const runtime = createRuntime();
+  loadExtension(runtime);
+  const ctx = createContext(runtime);
+  await emit(runtime, "session_start", { reason: "startup" }, ctx);
+  await command(runtime)("on --min-thinking-tokens 100", ctx);
+
+  const firstPayload = {
+    input: [
+      { role: "system", content: "BASE PI SYSTEM PROMPT" },
+      { role: "user", content: "Implement the task" },
+    ],
+    tools: [
+      { type: "function", name: "read", description: "read", parameters: {} },
+      { type: "function", name: "bash", description: "bash", parameters: {} },
+      { type: "function", name: "str_replace_editor", description: "editor", parameters: {} },
+    ],
+  };
+  await emit(runtime, "before_provider_request", { payload: firstPayload }, ctx);
+  await emit(runtime, "message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", name: "bash", arguments: { command: "pwd" } }],
+      stopReason: "toolUse",
+      usage: { reasoning: 100 },
+    },
+  }, ctx);
+
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "in-flight",
+    minThinkingTokens: 100,
+    thinkingTokens: 100,
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
+
+  await emit(runtime, "tool_result", { toolName: "bash" }, ctx);
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "anchored",
+    minThinkingTokens: 100,
+    thinkingTokens: 100,
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+
+  const secondPayload = {
+    input: [
+      { role: "system", content: "BASE PI SYSTEM PROMPT" },
+      { role: "user", content: "Implement the task" },
+      { role: "assistant", content: "tool call" },
+      { role: "user", content: "tool result" },
+    ],
+    tools: firstPayload.tools,
+  };
+  const second = (await emit(runtime, "before_provider_request", { payload: secondPayload }, ctx))[0] as any;
+  assert.deepEqual(second.tools.map((tool: any) => tool.name), ["bash", "str_replace_editor"]);
+
+  await emit(runtime, "message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Ready" }],
+      stopReason: "stop",
+      usage: { reasoning: 1 },
+    },
+  }, ctx);
+
+  assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write"]);
+  assert.deepEqual(runtime.entries.at(-1)?.data, {
+    enabled: true,
+    phase: "promoted",
+    baselineTools: ["read", "bash", "edit", "write"],
+  });
+
+  const third = (await emit(runtime, "before_provider_request", { payload: secondPayload }, ctx))[0] as any;
+  assert.deepEqual(third.tools.map((tool: any) => tool.name), ["read", "bash", "str_replace_editor"]);
+  assert.equal(third.input.some((item: any) => (
+    item.role === "user"
+    && Array.isArray(item.content)
+    && item.content.some((part: any) => /<v4-anchor-context>/.test(part.text ?? ""))
+  )), true);
 });
 
 test("rewrites Chat Completions and Anthropic Messages requests through the runtime lifecycle", async () => {
@@ -698,6 +869,36 @@ test("disables an armed anchor on compaction and restores tools before session r
     phase: "bootstrap",
     baselineTools: ["read", "bash", "edit", "write"],
   });
+});
+
+test("keeps an anchored hold branch minimal across reload and fork", async () => {
+  for (const reason of ["reload", "fork"] as const) {
+    const entries = [
+      {
+        type: "custom",
+        customType: "v4-anchor-state",
+        data: {
+          enabled: true,
+          phase: "anchored",
+          hold: true,
+          baselineTools: ["read", "bash", "edit", "write"],
+        },
+      },
+      { type: "message", message: { role: "user", content: "completed first turn" } },
+    ];
+    const runtime = createRuntime(entries);
+    loadExtension(runtime, { enabled: true, hold: true });
+    const ctx = createContext(runtime);
+
+    await emit(runtime, "session_start", { reason }, ctx);
+
+    assert.deepEqual(runtime.activeTools, ["read", "bash", "edit", "write", "str_replace_editor"]);
+    assert.match(runtime.statuses.get("v4-anchor") ?? "", /anchored:hold/);
+    assert.deepEqual(
+      runtime.entries.filter((entry) => entry.customType === "v4-anchor-state").at(-1)?.data,
+      entries[0]!.data,
+    );
+  }
 });
 
 test("keeps a promoted target-model branch promoted across reload and fork", async () => {

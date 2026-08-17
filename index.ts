@@ -17,11 +17,12 @@ import {
   readAnchorSnapshot,
   restoreSystemPrompt,
   rewriteBootstrapPayload,
+  rewriteMinimalPayload,
   rewritePersistentPayload,
   type AnchorApi,
   type AnchorState,
 } from "./src/core.ts";
-import { FileAnchorIntentStore, type AnchorIntentStore } from "./src/intent.ts";
+import { FileAnchorIntentStore, type AnchorIntent, type AnchorIntentStore } from "./src/intent.ts";
 import { EDITOR_DESCRIPTION, executeEditor } from "./src/editor.ts";
 
 const STATUS_KEY = "v4-anchor";
@@ -60,6 +61,9 @@ type AssistantLike = {
   role?: string;
   content?: unknown;
   stopReason?: string;
+  usage?: {
+    reasoning?: number;
+  };
 };
 
 export interface PiV4AnchorOptions {
@@ -71,9 +75,14 @@ function statusText(state: AnchorState, desiredEnabled: boolean, model: unknown)
   if (!isTargetModel(model) || !state.enabled || state.phase === "off") {
     return "v4-anchor:standby";
   }
-  return state.phase === "promoted"
-    ? "v4-anchor:promoted:persistent"
-    : `v4-anchor:${state.phase}`;
+  if (state.phase === "promoted") return "v4-anchor:promoted:persistent";
+  if (state.phase === "anchored") {
+    if (state.hold) return "v4-anchor:anchored:hold";
+    if (state.minThinkingTokens !== undefined) {
+      return `v4-anchor:anchored:thinking=${state.thinkingTokens ?? 0}/${state.minThinkingTokens}`;
+    }
+  }
+  return `v4-anchor:${state.phase}`;
 }
 
 function notify(ctx: AnyContext, message: string, level: "info" | "warning" | "error"): void {
@@ -88,6 +97,11 @@ function hasToolCall(message: AssistantLike): boolean {
     const type = (block as { type?: unknown }).type;
     return type === "toolCall" || type === "tool_use" || type === "function_call";
   });
+}
+
+function reasoningTokens(message: AssistantLike): number {
+  const tokens = message.usage?.reasoning;
+  return Number.isSafeInteger(tokens) && (tokens ?? -1) >= 0 ? tokens as number : 0;
 }
 
 function sameFilesystemPath(left: string, right: string): boolean {
@@ -116,7 +130,8 @@ function branchEntries(ctx: AnyContext): readonly unknown[] {
 
 export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions = {}): void {
   const intentStore = options.intentStore ?? new FileAnchorIntentStore();
-  let desiredEnabled = intentStore.read();
+  let desiredIntent = intentStore.read();
+  let desiredEnabled = desiredIntent.enabled;
   let state: AnchorState = { enabled: false, phase: "off" };
   let baselineTools: string[] | undefined;
   let baselineSystemPrompt: string | undefined;
@@ -141,17 +156,20 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
 
   function refreshDesiredIntent(): boolean {
     try {
-      desiredEnabled = intentStore.read();
+      desiredIntent = intentStore.read();
+      desiredEnabled = desiredIntent.enabled;
     } catch {
+      desiredIntent = { enabled: false };
       desiredEnabled = false;
     }
     return desiredEnabled;
   }
 
-  function writeDesiredIntent(enabled: boolean, ctx: AnyContext): boolean {
+  function writeDesiredIntent(intent: AnchorIntent, ctx: AnyContext): boolean {
     try {
-      intentStore.write(enabled);
-      desiredEnabled = enabled;
+      intentStore.write(intent);
+      desiredIntent = intent;
+      desiredEnabled = intent.enabled;
       return true;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -188,7 +206,24 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
   }
 
   function isArmed(): boolean {
-    return state.enabled && (state.phase === "bootstrap" || state.phase === "in-flight");
+    return state.enabled && (
+      state.phase === "bootstrap"
+      || state.phase === "in-flight"
+      || state.phase === "anchored"
+    );
+  }
+
+  function configuredState(phase: AnchorState["phase"]): AnchorState {
+    if (desiredIntent.hold) return { enabled: true, phase, hold: true };
+    if (desiredIntent.minThinkingTokens !== undefined) {
+      return {
+        enabled: true,
+        phase,
+        minThinkingTokens: desiredIntent.minThinkingTokens,
+        thinkingTokens: 0,
+      };
+    }
+    return { enabled: true, phase };
   }
 
   function checkBashAndEditorAvailability(ctx: AnyContext): boolean {
@@ -269,7 +304,7 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
     baselineTools = captureCurrentTools();
     baselineSystemPrompt = ctx.getSystemPrompt();
     setArmedTools();
-    setState({ enabled: true, phase: "bootstrap" }, ctx, persist);
+    setState(configuredState("bootstrap"), ctx, persist);
     return true;
   }
 
@@ -303,9 +338,9 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
     await ctx.waitForIdle();
   }
 
-  async function activate(ctx: ExtensionCommandContext): Promise<void> {
+  async function activate(ctx: ExtensionCommandContext, intent: AnchorIntent = { enabled: true }): Promise<void> {
     await waitForIdle(ctx);
-    if (!writeDesiredIntent(true, ctx)) return;
+    if (!writeDesiredIntent(intent, ctx)) return;
 
     if (!isTargetModel(ctx.model)) {
       updateStatus(ctx);
@@ -313,6 +348,15 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
       return;
     }
     if (state.enabled && state.phase !== "off") {
+      if (state.phase === "bootstrap" || state.phase === "anchored") {
+        const thinkingTokens = state.phase === "anchored" && intent.minThinkingTokens !== undefined
+          ? state.thinkingTokens ?? 0
+          : undefined;
+        setState({
+          ...configuredState(state.phase),
+          ...(thinkingTokens === undefined ? {} : { thinkingTokens }),
+        }, ctx);
+      }
       reconcileForModel(ctx);
       notify(ctx, `V4 anchor is already ${state.phase}.`, "info");
       return;
@@ -329,7 +373,7 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
   async function deactivate(ctx: ExtensionCommandContext, announce = true): Promise<void> {
     await waitForIdle(ctx);
     const wasDesired = desiredEnabled;
-    if (!writeDesiredIntent(false, ctx)) return;
+    if (!writeDesiredIntent({ enabled: false }, ctx)) return;
     const wasEnabled = state.enabled;
     clearLocalState(ctx);
     if (announce) {
@@ -346,14 +390,36 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
   function describeStatus(ctx: ExtensionCommandContext): void {
     refreshDesiredIntent();
     const target = isTargetModel(ctx.model) ? "target model" : "inactive model";
-    const intent = desiredEnabled ? "global enablement on" : "global enablement off";
+    const intent = desiredEnabled
+      ? desiredIntent.hold
+        ? "global hold mode"
+        : desiredIntent.minThinkingTokens !== undefined
+          ? `global threshold ${desiredIntent.minThinkingTokens} reasoning tokens`
+          : "global enablement on"
+      : "global enablement off";
     notify(ctx, `${statusText(state, desiredEnabled, ctx.model)} (${target}; ${intent})`, "info");
   }
 
-  function promote(ctx: ExtensionContext): void {
+  function promote(ctx: AnyContext): void {
     if (!state.enabled || state.phase === "promoted") return;
     restoreTools(ctx);
     setState({ enabled: true, phase: "promoted" }, ctx);
+  }
+
+  async function promoteManually(ctx: ExtensionCommandContext): Promise<void> {
+    await waitForIdle(ctx);
+    refreshDesiredIntent();
+    if (!state.enabled || state.phase === "off") {
+      updateStatus(ctx);
+      notify(ctx, "V4 anchor has no active branch to promote.", "warning");
+      return;
+    }
+    if (state.phase === "promoted") {
+      notify(ctx, "V4 anchor is already promoted for this branch.", "info");
+      return;
+    }
+    promote(ctx);
+    notify(ctx, "V4 anchor promoted this branch; baseline tools are active for the next request.", "info");
   }
 
   function disableForPayloadFailure(ctx: ExtensionContext, reason: string, payload: unknown, api: AnchorApi | undefined): unknown {
@@ -368,23 +434,37 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
   }
 
   pi.registerCommand("v4-anchor", {
-    description: "Globally enable, disable, or inspect the DeepSeek V4 Pro trajectory anchor",
+    description: "Configure or inspect the DeepSeek V4 Pro trajectory anchor",
     getArgumentCompletions: (argumentPrefix) => {
-      const values = ["on", "off", "status"];
+      const values = ["on", "on --min-thinking-tokens ", "hold", "promote", "off", "status"];
       return values
-        .filter((value) => value.startsWith(argumentPrefix.trim().toLowerCase()))
-        .map((value) => ({ value, label: value }));
+        .filter((value) => value.startsWith(argumentPrefix.trimStart().toLowerCase()))
+        .map((value) => ({ value, label: value.trimEnd() }));
     },
     handler: async (args, ctx) => {
       const command = args.trim().toLowerCase() || "status";
       if (command === "on") {
         await activate(ctx);
+        return;
+      }
+      const thresholdMatch = /^on\s+--min-thinking-tokens(?:=|\s+)(\d+)$/.exec(command);
+      if (thresholdMatch) {
+        const minThinkingTokens = Number(thresholdMatch[1]);
+        if (!Number.isSafeInteger(minThinkingTokens) || minThinkingTokens <= 0) {
+          notify(ctx, "--min-thinking-tokens must be a positive safe integer.", "warning");
+          return;
+        }
+        await activate(ctx, { enabled: true, minThinkingTokens });
+      } else if (command === "hold") {
+        await activate(ctx, { enabled: true, hold: true });
+      } else if (command === "promote") {
+        await promoteManually(ctx);
       } else if (command === "off") {
         await deactivate(ctx);
       } else if (command === "status") {
         describeStatus(ctx);
       } else {
-        notify(ctx, "Usage: /v4-anchor on|off|status", "warning");
+        notify(ctx, "Usage: /v4-anchor on [--min-thinking-tokens N]|hold|promote|off|status", "warning");
       }
     },
   });
@@ -422,6 +502,16 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
 
     if (!isTargetModel(ctx.model)) {
       if (isArmed()) restoreTools(ctx);
+      updateStatus(ctx);
+      return;
+    }
+
+    if (state.enabled && state.phase === "anchored") {
+      if (!checkBashAndEditorAvailability(ctx)) {
+        clearLocalState(ctx);
+        return;
+      }
+      setArmedTools();
       updateStatus(ctx);
       return;
     }
@@ -507,13 +597,18 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
           baselineSystemPrompt ?? ctx.getSystemPrompt(),
           api,
         );
-        const rewritten = rewriteBootstrapPayload(event.payload, {
-          api,
-          modelId: typeof model.id === "string" ? model.id : undefined,
-          maxOutputTokens: undefined,
-        });
+        const rewritten = state.phase === "anchored"
+          ? rewriteMinimalPayload(event.payload, {
+            api,
+            modelId: typeof model.id === "string" ? model.id : undefined,
+          })
+          : rewriteBootstrapPayload(event.payload, {
+            api,
+            modelId: typeof model.id === "string" ? model.id : undefined,
+            maxOutputTokens: undefined,
+          });
         if (state.phase === "bootstrap") {
-          setState({ enabled: true, phase: "in-flight" }, ctx);
+          setState({ ...state, enabled: true, phase: "in-flight" }, ctx);
         }
         return rewritten;
       } catch (error) {
@@ -542,30 +637,55 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
 
   pi.on("after_provider_response", (event, ctx) => {
     if (!state.enabled || state.phase !== "in-flight" || event.status < 400) return;
-    setState({ enabled: true, phase: "bootstrap" }, ctx);
+    setState({ ...state, enabled: true, phase: "bootstrap" }, ctx);
     notify(ctx, "V4 anchor bootstrap failed; it remains armed for a retry.", "warning");
   });
 
   pi.on("message_end", (event, ctx) => {
-    if (!state.enabled || state.phase !== "in-flight") return;
+    if (!state.enabled || (state.phase !== "in-flight" && state.phase !== "anchored")) return;
     const message = event.message as AssistantLike;
     if (message.role !== "assistant") return;
-    if (hasToolCall(message)) return;
     if (message.stopReason === "error" || message.stopReason === "aborted") {
-      setState({ enabled: true, phase: "bootstrap" }, ctx);
+      if (state.phase === "in-flight") {
+        setState({ ...state, enabled: true, phase: "bootstrap" }, ctx);
+      }
       return;
     }
+    if (state.minThinkingTokens !== undefined) {
+      const thinkingTokens = (state.thinkingTokens ?? 0) + reasoningTokens(message);
+      const nextPhase = state.phase === "in-flight" && !hasToolCall(message)
+        ? "anchored"
+        : state.phase;
+      setState({ ...state, enabled: true, phase: nextPhase, thinkingTokens }, ctx);
+      if (thinkingTokens > state.minThinkingTokens) promote(ctx);
+      return;
+    }
+    if (state.hold) {
+      if (state.phase === "in-flight" && !hasToolCall(message)) {
+        setState({ ...state, enabled: true, phase: "anchored" }, ctx);
+      }
+      return;
+    }
+    if (state.phase === "in-flight" && hasToolCall(message)) return;
     promote(ctx);
   });
 
   pi.on("tool_result", (_event, ctx) => {
     if (!state.enabled || state.phase !== "in-flight") return;
+    if (state.hold || state.minThinkingTokens !== undefined) {
+      setState({ ...state, enabled: true, phase: "anchored" }, ctx);
+      return;
+    }
     promote(ctx);
   });
 
   pi.on("agent_end", (_event, ctx) => {
     if (state.enabled && state.phase === "in-flight") {
-      setState({ enabled: true, phase: "bootstrap" }, ctx);
+      setState({
+        ...state,
+        enabled: true,
+        phase: state.hold || state.minThinkingTokens !== undefined ? "anchored" : "bootstrap",
+      }, ctx);
     }
   });
 }

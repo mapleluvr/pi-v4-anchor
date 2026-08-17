@@ -19,10 +19,11 @@ OpenAI Responses、OpenAI Chat Completions 和 Anthropic Messages (`/v1/messages
 
 ## 行为
 
-扩展默认关闭。`/v4-anchor on` 会在当前 `PI_CODING_AGENT_DIR` 写入一个只含
-`{ "version": 1, "enabled": true }` 的用户级意图文件。任何发现并加载了本扩展、且
-共享该 agent directory 的 Pi 进程都会在自身的 session 启动、模型选择和首个 provider
-请求边界检查该意图与模型；这包括 pi-subagents 启动的子 Pi。
+扩展默认关闭。`/v4-anchor on` 会在当前 `PI_CODING_AGENT_DIR` 写入一个 v2 用户级
+意图文件（默认只含 `{ "version": 2, "enabled": true }`）。也可以把启动策略一并写入
+共享意图：`hold`，或 `minThinkingTokens` 阈值。v1 的旧文件仍会迁移读取为默认 `on`。
+任何发现并加载了本扩展、且共享该 agent directory 的 Pi 进程都会在自身的 session 启动、
+模型选择和首个 provider 请求边界检查该意图与模型；这包括 pi-subagents 启动的子 Pi。
 
 实际 bootstrap 仍只会发生在全新、未 compact、未 fork 且没有已有对话的目标模型 branch：
 
@@ -38,12 +39,16 @@ OpenAI Responses、OpenAI Chat Completions 和 Anthropic Messages (`/v1/messages
      `tool_choice`、`max_tokens`/`max_completion_tokens`。
    - Anthropic Messages：顶层 `system`、`messages`、`input_schema` 工具、
      `tool_choice` 和 `max_tokens`。
-5. 首个普通 assistant 响应或首个 tool result 后恢复完整 baseline tools。
+5. 默认 `on` 在首个普通 assistant 响应或首个 tool result 后 promote；
+   `hold` 会继续使用两工具的 Minimal continuation，直到显式 `promote`。
+   阈值模式会累计每个 assistant message 的 `usage.reasoning`，在累计值严格
+   大于阈值后，让下一个 request promote。provider 不提供 reasoning breakdown
+   时累计值不会增长，可用 `promote` 手动结束 anchored 阶段。
 6. `promoted` 默认是 persistent：后续每个 provider wire payload 继续保留 Minimal
    system persona；原 Pi、项目和 Magic Context system prompt 会作为标记化的
    `<v4-anchor-context>` user-context 项回注，而不会恢复到 system role 或写回 session。
-7. `/v4-anchor off` 关闭共享意图。当前 armed branch 恢复启用前的工具集合；已
-   promoted branch 已恢复 baseline，不会覆盖用户之后的 active-tool 调整。
+7. `/v4-anchor off` 关闭共享意图。当前 armed/anchored branch 恢复启用前的工具集合；
+   已 promoted branch 已恢复 baseline，不会覆盖用户之后的 active-tool 调整。
 
 非目标模型处于 `standby`，不会发送 anchor payload。用户随后切换到一个全新的目标模型
 branch 时，只要共享意图仍开启，它会自动 armed；不会因非目标模型而清除全局意图。
@@ -63,12 +68,13 @@ branch 时，只要共享意图仍开启，它会自动 armed；不会因非目�
 工具注册和工具 active 状态与其他扩展共存。比如 Magic Context 的
 `ctx_search`、`ctx_memory`、`ctx_note`、`ctx_expand`、`ctx_reduce` 和
 `todowrite` 不会被 anchor 注销、覆盖或从 baseline 丢失；首轮完成后它们会
-出现在恢复后的 provider 请求中。
+出现在 promote 后的恢复 provider 请求中。
 
 首个 bootstrap 请求只发送 `bash` 和 `str_replace_editor` 是 anchor 的刻意
 轨迹约束。因此其他工具虽然仍注册并保持在 Pi runtime 的 active 集合中，但
-模型在这一个 wire request 中不能调用它们。首轮返回文本或完成首个 tool result
-后，完整工具集合恢复，后续请求可以正常使用 Magic Context 工具。Persistent
+模型在这个 wire request 以及 hold/阈值尚未满足时的 anchored continuation 中不能调用它们。
+默认 `on` 的首个响应或 tool result 后、手动 `promote` 后，或阈值满足后的下一个 request
+开始，完整工具集合恢复，后续请求可以正常使用 Magic Context 工具。Persistent
 模式同时会把 Pi/Magic Context system 内容作为 wire-only user context 回注，以保持
 Minimal persona 的 system role。
 
@@ -119,27 +125,38 @@ pi -e "."
 /thinking max
 ```
 
-`/on` 本身不要求当前模型已经匹配；非目标模型会显示 `standby`。实际 bootstrap 必须发生在
+`/v4-anchor on` 本身不要求当前模型已经匹配；非目标模型会显示 `standby`。实际 bootstrap 必须发生在
 该 Pi 的第一条普通用户消息之前的全新目标模型 session。可用命令：
 
 ```text
 /v4-anchor on
+/v4-anchor on --min-thinking-tokens 4096
+/v4-anchor hold
+/v4-anchor promote
 /v4-anchor off
 /v4-anchor status
 ```
 
+不带参数的 `on` 保持现有默认行为：首个 assistant response/tool result 后 promote。
+`hold` 让当前及共享意图下的新 fresh branch 都等待手动 promote。`on --min-thinking-tokens N`
+要求累计的 reasoning token 数严格大于正整数 `N` 后，才在下一个 provider request 恢复
+baseline tools；累计值跨 tool-result continuation 保存在 branch state 中。`promote` 只解锁
+当前 branch，不关闭共享的 hold/threshold 意图，因此之后新建的 fresh branch 仍遵循该意图。
 `status` 可能显示以下阶段：
 
 - `off`：共享意图关闭，所有 anchor 行为旁路。
 - `standby`：共享意图开启，但当前模型不匹配或当前 branch 不可 fresh bootstrap。
 - `bootstrap`：目标模型已 armed，等待首个 provider 请求。
 - `in-flight`：首个 anchor 请求正在执行。
-- `promoted:persistent`：首请求已完成，baseline tools 已恢复，后续请求持续保持
+- `anchored:hold`：首个响应已完成，仍保持两工具 Minimal continuation，等待 `promote`。
+- `anchored:thinking=N/M`：已累计 N 个 reasoning tokens，尚未超过阈值 M。
+- `promoted:persistent`：本 branch 已 promote，baseline tools 已恢复，后续请求持续保持
   Minimal system persona，并以 wire-only user context 回注原 system 内容。
 
-切换到非目标模型只会进入 `standby`，不会关闭共享意图。reload 会在仍然 fresh 的目标
-branch 上恢复 armed 状态；armed branch 遇到 fork、compaction 或已有对话时会恢复 baseline
-并关闭该 branch 的 armed 状态。`promoted` branch 在 reload/fork 后仍持续使用 persistent
+切换到非目标模型只会进入 `standby`，不会关闭共享意图。reload/fork 会在已经进入
+`anchored` 或 `promoted` 的目标 branch 上恢复对应状态；仍处于初始 `bootstrap` 的 branch
+只有在仍然 fresh 时恢复 armed。任何 armed/anchored branch 遇到 compaction 会恢复 baseline
+并关闭该 branch 的 anchor 状态。`promoted` branch 在 reload/fork 后仍持续使用 persistent
 payload 改写，但不会重新执行首次两工具 bootstrap。
 
 ## 安全边界

@@ -14,7 +14,8 @@
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:live": "node --experimental-strip-types scripts/live-smoke.ts --run-paid",
-    "test:live:tool": "node --experimental-strip-types scripts/live-smoke.ts --run-paid --tool"
+    "test:live:tool": "node --experimental-strip-types scripts/live-smoke.ts --run-paid --tool",
+    "probe:posthoc": "node --experimental-strip-types scripts/probe-posthoc-tools.ts --run-paid"
   },
   "files": [
     "index.ts",

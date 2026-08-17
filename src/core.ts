@@ -378,11 +378,14 @@ export function rewritePersistentPayload(
 
 export const ANCHOR_STATE_ENTRY = "v4-anchor-state";
 
-export type AnchorPhase = "off" | "bootstrap" | "in-flight" | "promoted";
+export type AnchorPhase = "off" | "bootstrap" | "in-flight" | "anchored" | "promoted";
 
 export interface AnchorState {
   enabled: boolean;
   phase: AnchorPhase;
+  hold?: true;
+  minThinkingTokens?: number;
+  thinkingTokens?: number;
 }
 
 export interface AnchorSnapshot {
@@ -391,7 +394,7 @@ export interface AnchorSnapshot {
 }
 
 const OFF_STATE: AnchorState = { enabled: false, phase: "off" };
-const VALID_PHASES = new Set<AnchorPhase>(["off", "bootstrap", "in-flight", "promoted"]);
+const VALID_PHASES = new Set<AnchorPhase>(["off", "bootstrap", "in-flight", "anchored", "promoted"]);
 
 export function isTargetModel(model: unknown): boolean {
   return isRecord(model)
@@ -432,6 +435,14 @@ export function readAnchorSnapshot(entries: readonly unknown[]): AnchorSnapshot 
       enabled: data.enabled,
       phase: data.enabled ? data.phase as AnchorPhase : "off",
     };
+    if (state.enabled && data.hold === true) {
+      state.hold = true;
+    } else if (state.enabled && Number.isSafeInteger(data.minThinkingTokens) && (data.minThinkingTokens as number) > 0) {
+      state.minThinkingTokens = data.minThinkingTokens as number;
+      if (Number.isSafeInteger(data.thinkingTokens) && (data.thinkingTokens as number) >= 0) {
+        state.thinkingTokens = data.thinkingTokens as number;
+      }
+    }
     const baselineTools = state.enabled ? parseBaselineTools(data.baselineTools) : undefined;
     snapshot = baselineTools === undefined ? { state } : { state, baselineTools };
   }
@@ -574,6 +585,77 @@ export function rewriteBootstrapPayload(
   } else {
     delete rewritten.max_output_tokens;
     delete rewritten.max_completion_tokens;
+  }
+
+  return rewritten;
+}
+
+export function rewriteMinimalPayload(
+  payload: unknown,
+  options: Omit<BootstrapPayloadOptions, "maxOutputTokens"> = {},
+): unknown {
+  if (!isRecord(payload)) {
+    throw new Error("Provider payload must be an object");
+  }
+  const api = options.api ?? detectPayloadApi(payload);
+  if (!api || !isAnchorApi(api)) {
+    throw new Error("Provider payload API is not supported by v4-anchor");
+  }
+  if (!Array.isArray(payload.tools)) {
+    throw new Error("Provider payload does not contain a tools array");
+  }
+
+  const modelId = options.modelId ?? TARGET_MODEL_SUFFIX;
+  if (!modelId.endsWith(TARGET_MODEL_SUFFIX)) {
+    throw new Error("Provider model id does not end with deepseek-v4-pro");
+  }
+
+  const rewritten: JsonRecord = {
+    ...payload,
+    model: modelId,
+    stream: true,
+    tools: selectedBootstrapTools(payload.tools, api),
+  };
+
+  if (api === "openai-responses") {
+    if (!Array.isArray(payload.input)) {
+      throw new Error("Provider payload does not contain an input array");
+    }
+    rewritten.store = false;
+    rewritten.input = rewriteSystemItems(payload.input);
+    if ("instructions" in payload) rewritten.instructions = MINIMAL_PERSONA;
+    if ("tool_choice" in payload) rewritten.tool_choice = "auto";
+    delete rewritten.conversation;
+    delete rewritten.previous_response_id;
+    delete rewritten.prompt;
+    delete rewritten.messages;
+    delete rewritten.system;
+  } else if (api === "openai-completions") {
+    if (!Array.isArray(payload.messages)) {
+      throw new Error("Provider payload does not contain a messages array");
+    }
+    rewritten.messages = rewriteSystemItems(payload.messages);
+    if ("tool_choice" in payload) rewritten.tool_choice = "auto";
+    delete rewritten.instructions;
+    delete rewritten.system;
+    delete rewritten.input;
+    delete rewritten.conversation;
+    delete rewritten.previous_response_id;
+    delete rewritten.prompt;
+    delete rewritten.store;
+  } else {
+    if (!Array.isArray(payload.messages)) {
+      throw new Error("Provider payload does not contain a messages array");
+    }
+    rewritten.system = rewriteAnthropicSystem(payload.system, MINIMAL_PERSONA);
+    rewritten.messages = [...payload.messages];
+    if ("tool_choice" in payload) rewritten.tool_choice = { type: "auto" };
+    delete rewritten.instructions;
+    delete rewritten.input;
+    delete rewritten.conversation;
+    delete rewritten.previous_response_id;
+    delete rewritten.prompt;
+    delete rewritten.store;
   }
 
   return rewritten;

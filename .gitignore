@@ -4,6 +4,7 @@ coverage/
 *.tsbuildinfo
 *.tgz
 pi-v4-anchor-state.json
+scrapling-tweet.md
 *.log
 npm-debug.log*
 .DS_Store

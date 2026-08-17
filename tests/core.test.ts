@@ -11,6 +11,7 @@ import {
   readAnchorState,
   restoreSystemPrompt,
   rewriteBootstrapPayload,
+  rewriteMinimalPayload,
 } from "../src/core.ts";
 
 test("normalizes Windows-native, MSYS, and WSL paths without guessing a drive", () => {
@@ -162,6 +163,39 @@ test("rewrites an OpenAI Chat Completions bootstrap payload without leaking norm
   assert.equal(rewritten.model, "proxy/deepseek-v4-pro");
   assert.equal(rewritten.stream, true);
   assert.equal(rewritten.max_completion_tokens, 2048);
+});
+
+test("rewrites an anchored continuation while preserving assistant and tool history", () => {
+  const payload = {
+    model: "proxy/deepseek-v4-pro",
+    stream: false,
+    messages: [
+      { role: "system", content: "Full Pi system prompt" },
+      { role: "user", content: "Implement the task" },
+      { role: "assistant", content: "<think>reasoning</think>", tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "ok" },
+    ],
+    tools: [
+      { type: "function", function: { name: "read", description: "Read files", parameters: {} } },
+      { type: "function", function: { name: "bash", description: "Normal bash", parameters: {} } },
+      { type: "function", function: { name: "str_replace_editor", description: "Editor", parameters: {} } },
+    ],
+    max_completion_tokens: 2048,
+  };
+
+  const rewritten = rewriteMinimalPayload(payload, {
+    api: "openai-completions",
+    modelId: "proxy/deepseek-v4-pro",
+  }) as typeof payload;
+
+  assert.deepEqual(rewritten.messages, [
+    { role: "system", content: MINIMAL_PERSONA },
+    ...payload.messages.slice(1),
+  ]);
+  assert.deepEqual(rewritten.tools.map((tool) => tool.function.name), ["bash", "str_replace_editor"]);
+  assert.equal(rewritten.stream, true);
+  assert.equal(rewritten.max_completion_tokens, 2048);
+  assert.equal(payload.messages[0].content, "Full Pi system prompt");
 });
 
 test("rewrites an Anthropic Messages v1 bootstrap payload with its native schema", () => {
@@ -433,6 +467,38 @@ test("reads a validated baseline tool snapshot for an armed state", () => {
     },
   ]), {
     state: { enabled: true, phase: "bootstrap" },
+  });
+});
+
+test("validates persisted reasoning threshold state", () => {
+  assert.deepEqual(readAnchorSnapshot([{
+    type: "custom",
+    customType: "v4-anchor-state",
+    data: {
+      enabled: true,
+      phase: "anchored",
+      minThinkingTokens: 2048,
+      thinkingTokens: 1024,
+    },
+  }]).state, {
+    enabled: true,
+    phase: "anchored",
+    minThinkingTokens: 2048,
+    thinkingTokens: 1024,
+  });
+
+  assert.deepEqual(readAnchorSnapshot([{
+    type: "custom",
+    customType: "v4-anchor-state",
+    data: {
+      enabled: true,
+      phase: "anchored",
+      minThinkingTokens: -1,
+      thinkingTokens: Number.POSITIVE_INFINITY,
+    },
+  }]).state, {
+    enabled: true,
+    phase: "anchored",
   });
 });
 
