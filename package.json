@@ -1,7 +1,7 @@
 {
   "name": "pi-v4-anchor",
   "version": "0.3.0",
-  "description": "A reversible DeepSeek V4 Pro trajectory anchor for Pi",
+  "description": "A reversible DeepSeek V4 Pro / Flash trajectory anchor for Pi",
   "type": "module",
   "keywords": [
     "pi-package",

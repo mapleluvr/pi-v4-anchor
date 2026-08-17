@@ -417,15 +417,66 @@ test("refuses a bootstrap request when the serialized anchor tool pair is incomp
     /missing required bootstrap tool.*str_replace_editor/i,
   );
 });
-test("matches only the deepseek-v4-pro model suffix across supported APIs", () => {
+test("accepts a deepseek-v4-flash model id in bootstrap and minimal payload rewrites", () => {
+  const perApiPayload = {
+    "openai-responses": {
+      model: "gateway/deepseek-v4-flash",
+      input: [{ role: "system", content: "Full Pi system prompt" }, { role: "user", content: "Work" }],
+      tools: [
+        { type: "function", name: "bash", description: "bash", parameters: {} },
+        { type: "function", name: "str_replace_editor", description: "editor", parameters: {} },
+      ],
+    },
+    "openai-completions": {
+      model: "gateway/deepseek-v4-flash",
+      messages: [{ role: "system", content: "Full Pi system prompt" }, { role: "user", content: "Work" }],
+      tools: [
+        { type: "function", function: { name: "bash", description: "bash", parameters: {} } },
+        { type: "function", function: { name: "str_replace_editor", description: "editor", parameters: {} } },
+      ],
+    },
+    "anthropic-messages": {
+      model: "gateway/deepseek-v4-flash",
+      messages: [{ role: "user", content: "Work" }],
+      tools: [
+        { name: "bash", description: "bash", input_schema: { type: "object", properties: {} } },
+        { name: "str_replace_editor", description: "editor", input_schema: { type: "object", properties: {} } },
+      ],
+    },
+  } as const;
+  for (const api of ["openai-responses", "openai-completions", "anthropic-messages"] as const) {
+    const payload = perApiPayload[api];
+    const bootstrap = rewriteBootstrapPayload(payload, { api, modelId: "gateway/deepseek-v4-flash" }) as typeof payload;
+    assert.equal(bootstrap.model, "gateway/deepseek-v4-flash");
+    const minimal = rewriteMinimalPayload(payload, { api, modelId: "gateway/deepseek-v4-flash" }) as typeof payload;
+    assert.equal(minimal.model, "gateway/deepseek-v4-flash");
+  }
+  assert.throws(
+    () => rewriteBootstrapPayload(perApiPayload["openai-responses"], { api: "openai-responses", modelId: "gateway/deepseek-v4-flash-preview" }),
+    /does not end with deepseek-v4-pro or deepseek-v4-flash/,
+  );
+  assert.throws(
+    () => rewriteMinimalPayload(perApiPayload["openai-responses"], { api: "openai-responses", modelId: "gateway/deepseek-v4-flash-preview" }),
+    /does not end with deepseek-v4-pro or deepseek-v4-flash/,
+  );
+});
+
+test("matches only the deepseek-v4-pro / deepseek-v4-flash model suffixes across supported APIs", () => {
   assert.equal(isTargetModel({ provider: "any-provider", id: "deepseek-v4-pro", api: "openai-responses" }), true);
   assert.equal(isTargetModel({ provider: "gateway", id: "gateway/deepseek-v4-pro", api: "openai-completions" }), true);
   assert.equal(isTargetModel({ provider: "proxy", id: "alias/deepseek-v4-pro", api: "anthropic-messages" }), true);
   assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-pro", api: "openai-completions" }), true);
   assert.equal(isTargetModel({ provider: "provider-b", id: "deepseek-v4-pro", api: "openai-responses" }), true);
   assert.equal(isTargetModel({ provider: "provider-c", id: "deepseek-v4-pro", api: "anthropic-messages" }), true);
+  assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-flash", api: "openai-responses" }), true);
+  assert.equal(isTargetModel({ provider: "gateway", id: "gateway/deepseek-v4-flash", api: "openai-completions" }), true);
+  assert.equal(isTargetModel({ provider: "proxy", id: "alias/deepseek-v4-flash", api: "anthropic-messages" }), true);
+  assert.equal(isTargetModel({ provider: "provider-b", id: "deepseek-v4-flash", api: "openai-responses" }), true);
   assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-pro:free", api: "openai-responses" }), false);
   assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-pro-preview", api: "openai-responses" }), false);
+  assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-flash:free", api: "openai-responses" }), false);
+  assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-flash-preview", api: "openai-responses" }), false);
+  assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4", api: "openai-responses" }), false);
   assert.equal(isTargetModel({ provider: "provider-a", id: "deepseek-v4-pro", api: "google-generative-ai" }), false);
   assert.equal(isTargetModel(undefined), false);
 });

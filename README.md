@@ -7,15 +7,16 @@ OpenAI Responses、OpenAI Chat Completions 和 Anthropic Messages (`/v1/messages
 ## 匹配范围
 
 扩展不绑定任何 provider。它只要求当前模型的 `id` 以精确后缀
-`deepseek-v4-pro` 结束，并且 API 是以下之一：
+`deepseek-v4-pro` 或 `deepseek-v4-flash` 结束，并且 API 是以下之一：
 
 - `openai-responses`
 - `openai-completions`
 - `anthropic-messages`
 
-因此 `provider-a/deepseek-v4-pro`、`gateway/deepseek-v4-pro` 和其他 provider
-下的同一模型后缀都可以匹配；`deepseek-v4-pro-preview` 和
-`deepseek-v4-pro:free` 不匹配。
+因此 `provider-a/deepseek-v4-pro`、`gateway/deepseek-v4-pro`、
+`provider-a/deepseek-v4-flash` 和其他 provider 下的同一模型后缀都可以匹配；
+`deepseek-v4-pro-preview`、`deepseek-v4-pro:free`、`deepseek-v4-flash-preview` 和
+`deepseek-v4-flash:free` 不匹配。
 
 ## 行为
 
@@ -125,6 +126,8 @@ pi -e "."
 /thinking max
 ```
 
+`deepseek-v4-flash` 同理，例如 `gateway/deepseek-v4-flash`。
+
 `/v4-anchor on` 本身不要求当前模型已经匹配；非目标模型会显示 `standby`。实际 bootstrap 必须发生在
 该 Pi 的第一条普通用户消息之前的全新目标模型 session。可用命令：
 
@@ -185,8 +188,8 @@ npm pack --dry-run
 ```
 
 显式付费的真实 provider smoke test 会发出一次 `max` reasoning 请求，并把输出上限
-临时设为 2048。默认会优先选择具有可用认证的 model id 以 `deepseek-v4-pro` 结尾的模型；
-也可以显式指定：
+临时设为 2048。默认会优先选择具有可用认证的 model id 以 `deepseek-v4-pro` 或
+`deepseek-v4-flash` 结尾的模型；也可以显式指定：
 
 ```powershell
 $env:PI_V4_ANCHOR_PROVIDER = "your-provider"

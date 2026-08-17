@@ -344,7 +344,7 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
 
     if (!isTargetModel(ctx.model)) {
       updateStatus(ctx);
-      notify(ctx, "V4 anchor is enabled for every Pi instance; this model is on standby until its id ends in deepseek-v4-pro.", "info");
+      notify(ctx, "V4 anchor is enabled for every Pi instance; this model is on standby until its id ends in deepseek-v4-pro or deepseek-v4-flash.", "info");
       return;
     }
     if (state.enabled && state.phase !== "off") {
@@ -434,7 +434,7 @@ export default function piV4Anchor(pi: ExtensionAPI, options: PiV4AnchorOptions 
   }
 
   pi.registerCommand("v4-anchor", {
-    description: "Configure or inspect the DeepSeek V4 Pro trajectory anchor",
+    description: "Configure or inspect the DeepSeek V4 Pro / Flash trajectory anchor",
     getArgumentCompletions: (argumentPrefix) => {
       const values = ["on", "on --min-thinking-tokens ", "hold", "promote", "off", "status"];
       return values

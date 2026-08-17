@@ -24,7 +24,14 @@ export const MINIMAL_BASH_PARAMETERS = {
 } as const;
 
 const BOOTSTRAP_TOOL_NAMES = ["bash", "str_replace_editor"] as const;
-const TARGET_MODEL_SUFFIX = "deepseek-v4-pro";
+const TARGET_MODEL_SUFFIXES = ["deepseek-v4-pro", "deepseek-v4-flash"] as const;
+
+export function targetModelSuffix(id: string): string | undefined {
+  for (const suffix of TARGET_MODEL_SUFFIXES) {
+    if (id.endsWith(suffix)) return suffix;
+  }
+  return undefined;
+}
 
 export type AnchorApi = "openai-responses" | "openai-completions" | "anthropic-messages";
 export type SupportedPlatform = "win32" | "posix";
@@ -399,7 +406,7 @@ const VALID_PHASES = new Set<AnchorPhase>(["off", "bootstrap", "in-flight", "anc
 export function isTargetModel(model: unknown): boolean {
   return isRecord(model)
     && typeof model.id === "string"
-    && model.id.endsWith(TARGET_MODEL_SUFFIX)
+    && targetModelSuffix(model.id) !== undefined
     && isAnchorApi(model.api);
 }
 
@@ -516,9 +523,9 @@ export function rewriteBootstrapPayload(
   }
 
   const selectedTools = selectedBootstrapTools(payload.tools, api);
-  const modelId = options.modelId ?? TARGET_MODEL_SUFFIX;
-  if (!modelId.endsWith(TARGET_MODEL_SUFFIX)) {
-    throw new Error("Provider model id does not end with deepseek-v4-pro");
+  const modelId = options.modelId ?? TARGET_MODEL_SUFFIXES[0];
+  if (targetModelSuffix(modelId) === undefined) {
+    throw new Error("Provider model id does not end with deepseek-v4-pro or deepseek-v4-flash");
   }
 
   const rewritten: JsonRecord = {
@@ -605,9 +612,9 @@ export function rewriteMinimalPayload(
     throw new Error("Provider payload does not contain a tools array");
   }
 
-  const modelId = options.modelId ?? TARGET_MODEL_SUFFIX;
-  if (!modelId.endsWith(TARGET_MODEL_SUFFIX)) {
-    throw new Error("Provider model id does not end with deepseek-v4-pro");
+  const modelId = options.modelId ?? TARGET_MODEL_SUFFIXES[0];
+  if (targetModelSuffix(modelId) === undefined) {
+    throw new Error("Provider model id does not end with deepseek-v4-pro or deepseek-v4-flash");
   }
 
   const rewritten: JsonRecord = {

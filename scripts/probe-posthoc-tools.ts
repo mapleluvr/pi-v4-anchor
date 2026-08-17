@@ -152,7 +152,7 @@ try {
   const candidates = modelPool.filter((candidate): candidate is ProbeModel => (
     candidate !== undefined
     && typeof candidate.id === "string"
-    && candidate.id.endsWith("deepseek-v4-pro")
+    && (candidate.id.endsWith("deepseek-v4-pro") || candidate.id.endsWith("deepseek-v4-flash"))
     && (candidate.api === "openai-completions"
       || candidate.api === "openai-responses"
       || candidate.api === "anthropic-messages")
@@ -172,7 +172,7 @@ try {
   }
   assert.ok(
     model,
-    `No supported model id ending in deepseek-v4-pro was found${requestedProvider ? ` for ${requestedProvider}` : ""}`,
+    `No supported deepseek-v4-pro or deepseek-v4-flash model was found${requestedProvider ? ` for ${requestedProvider}` : ""}`,
   );
 
   const bashTool = {

@@ -137,7 +137,7 @@ try {
   const candidates = modelPool.filter((candidate): candidate is NonNullable<typeof candidate> => (
     candidate !== undefined
     && typeof candidate.id === "string"
-    && candidate.id.endsWith("deepseek-v4-pro")
+    && (candidate.id.endsWith("deepseek-v4-pro") || candidate.id.endsWith("deepseek-v4-flash"))
     && (!requestedApi || candidate.api === requestedApi)
   ));
   let configuredModel = candidates.find((candidate) => supportedApi(candidate.api) && modelRuntime.hasConfiguredAuth(candidate.provider));
@@ -150,7 +150,7 @@ try {
       }
     }
   }
-  assert.ok(configuredModel, `No supported model id ending in deepseek-v4-pro was found${requestedProvider ? ` for ${requestedProvider}` : ""}`);
+  assert.ok(configuredModel, `No supported deepseek-v4-pro or deepseek-v4-flash model was found${requestedProvider ? ` for ${requestedProvider}` : ""}`);
   assert.ok(supportedApi(configuredModel.api), `Unsupported anchor API: ${configuredModel.api}`);
   const model = { ...configuredModel, maxTokens: 2_048 };
 
